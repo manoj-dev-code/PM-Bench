@@ -15,6 +15,10 @@ only. These bounds exist so that the things which DO mutate (config, agent
 tools) stay reasonable too.
 """
 
+import itertools
+import json
+import math
+
 DEFAULT_BOUNDS = {
     "max_tasks": 50,               # total tasks ever on the board
     "max_task_effort_hours": 80,   # one task can't be a month of work
@@ -44,6 +48,168 @@ def check_task_bounds(task, existing_count, bounds):
                 % (eh, bounds["min_task_effort_hours"],
                    bounds["max_task_effort_hours"]))
     return None
+
+
+def _numeric(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _stage_violations(stage, label, bounds, worker_ids):
+    """Phase-1 stage fields: ordinary bounded work, no nested local ephemera."""
+    errors = []
+    if not isinstance(stage, dict):
+        return [label + ": stage must be an object"]
+    sid = stage.get("id")
+    if not isinstance(sid, str) or not sid.strip():
+        errors.append(label + ": stage id must be a non-empty string")
+    elif "::" in sid:
+        errors.append(label + ": stage id may not contain '::'")
+    for key in ("title", "kind"):
+        if not isinstance(stage.get(key), str) or not stage[key].strip():
+            errors.append("%s: %s must be a non-empty string" % (label, key))
+    assignees = stage.get("assignees")
+    if (not isinstance(assignees, list) or not assignees
+            or any(not isinstance(a, str) for a in assignees)):
+        errors.append(label + ": assignees must name at least one worker")
+    else:
+        for a in assignees:
+            if a not in worker_ids:
+                errors.append("%s: assignee %r is not a worker" % (label, a))
+    effort = stage.get("effort_hours")
+    if not _numeric(effort) or not (
+            bounds["min_task_effort_hours"] <= effort
+            <= bounds["max_task_effort_hours"]):
+        errors.append(label + ": effort_hours outside task bounds")
+    done = stage.get("done_hours", 0)
+    if not _numeric(done) or done < 0 or (_numeric(effort) and done > effort):
+        errors.append(label + ": done_hours must be within 0..effort_hours")
+    for key in ("questions", "belief", "stages", "blocked_by", "contingent",
+                "hidden_until",
+                "work_item_id", "work_item_title", "stage_id", "stage_kind",
+                "score_weight_factor", "quality_reason"):
+        if key in stage:
+            errors.append("%s: %s is not supported inside stages in Phase 1"
+                          % (label, key))
+    return errors
+
+
+def _validate_staged_parent(task, where, bounds, worker_ids, authored_ids):
+    errors = []
+    label = "%s[%s]" % (where, task.get("id"))
+    stages = task.get("stages")
+    if not isinstance(task.get("title"), str) or not task["title"].strip():
+        errors.append(label + ": staged work needs a non-empty title")
+    for forbidden in ("assignees", "effort_hours", "done_hours", "questions",
+                      "belief"):
+        if forbidden in task:
+            errors.append("%s: staged work item may not have top-level %s"
+                          % (label, forbidden))
+    if not isinstance(stages, list) or len(stages) < 2:
+        return errors + [label + ": staged work needs at least two stages"]
+    local_ids = set()
+    generated = set()
+    for i, stage in enumerate(stages):
+        slabel = "%s.stages[%d]" % (label, i)
+        errors.extend(_stage_violations(stage, slabel, bounds, worker_ids))
+        sid = stage.get("id")
+        if isinstance(sid, str) and sid.strip() and "::" not in sid:
+            if sid in local_ids:
+                errors.append(slabel + ": duplicate stage id %r" % sid)
+            local_ids.add(sid)
+            gid = "%s::%s" % (task.get("id"), sid)
+            if gid in authored_ids or gid in generated:
+                errors.append(slabel + ": generated id %r collides" % gid)
+            generated.add(gid)
+        gate = stage.get("quality_gate")
+        if gate is None:
+            continue
+        glabel = slabel + ".quality_gate"
+        if (not isinstance(gate, dict) or set(gate) - {"outcome", "reason", "rework"}
+                or "outcome" not in gate or "reason" not in gate):
+            errors.append(glabel + ": bad fields")
+            continue
+        outcome = gate.get("outcome")
+        if outcome not in ("pass", "rework"):
+            errors.append(glabel + ": outcome must be pass|rework")
+        if not isinstance(gate.get("reason"), str) or not gate["reason"].strip():
+            errors.append(glabel + ": reason must be non-empty")
+        if outcome == "pass" and "rework" in gate:
+            errors.append(glabel + ": pass may not carry rework")
+        if outcome != "rework":
+            continue
+        rework = gate.get("rework")
+        if not isinstance(rework, dict):
+            errors.append(glabel + ": rework outcome requires a rework stage")
+            continue
+        errors.extend(_stage_violations(
+            rework, glabel + ".rework", bounds, worker_ids))
+        rid = rework.get("id")
+        if "quality_gate" in rework:
+            errors.append(glabel + ".rework: nested quality_gate is not allowed")
+        if isinstance(rid, str) and rid.strip() and "::" not in rid:
+            if rid in local_ids:
+                errors.append(glabel + ".rework: duplicate stage id %r" % rid)
+            gid = "%s::%s" % (task.get("id"), rid)
+            if gid in authored_ids or gid in generated:
+                errors.append(glabel + ".rework: generated id %r collides" % gid)
+            generated.add(gid)
+            local_ids.add(rid)
+    return errors
+
+
+def _materialized_cycles(tasks):
+    known = {t["id"] for t in tasks}
+    deps = {t["id"]: [d for d in t.get("blocked_by", []) if d in known]
+            for t in tasks}
+    visiting, visited = set(), set()
+
+    def visit(tid):
+        if tid in visited:
+            return False
+        if tid in visiting:
+            return True
+        visiting.add(tid)
+        cyclic = any(visit(dep) for dep in deps.get(tid, []))
+        visiting.remove(tid)
+        visited.add(tid)
+        return cyclic
+
+    return any(visit(t["id"]) for t in tasks)
+
+
+def _validate_materialized(tasks, bounds, worker_ids):
+    errors = []
+    ids = [t["id"] for t in tasks]
+    if len(ids) != len(set(ids)):
+        errors.append("materialized work has duplicate task ids")
+    if len(ids) > bounds["max_tasks"]:
+        errors.append("materialized work exceeds max_tasks=%d"
+                      % bounds["max_tasks"])
+    known = set(ids)
+    by_item = {}
+    for task in tasks:
+        for dep in task.get("blocked_by", []):
+            if dep not in known:
+                errors.append("materialized task %r has unknown blocker %r"
+                              % (task["id"], dep))
+        for a in task.get("assignees", []):
+            if a not in worker_ids:
+                errors.append("materialized task %r assignee %r is not a worker"
+                              % (task["id"], a))
+        msg = check_task_bounds(task, 0, bounds)
+        if msg:
+            errors.append("materialized task %r: %s" % (task["id"], msg))
+        if "work_item_id" in task:
+            by_item.setdefault(task["work_item_id"], []).append(
+                task.get("score_weight_factor", 0))
+    for item, factors in by_item.items():
+        if abs(sum(factors) - 1.0) > 1e-9:
+            errors.append("work item %r score factors sum to %s, not 1.0"
+                          % (item, sum(factors)))
+    if _materialized_cycles(tasks):
+        errors.append("materialized task dependencies contain a cycle")
+    return errors
 
 
 def validate_scenario(scenario):
@@ -77,6 +243,7 @@ def validate_scenario(scenario):
         errors.append("too many beats: %d > %d" % (len(beats), b["max_beats"]))
 
     seen_ids = set()
+    seen_question_ids = set()
     all_specs = [(t, "project.tasks") for t in tasks] + \
                 [(a["task"], "task_arrivals") for a in arrivals]
     known_ids = {t["id"] for t, _ in all_specs}
@@ -122,9 +289,20 @@ def validate_scenario(scenario):
             errors.append("%s[%s]: %d questions > max_questions_per_task=%d"
                           % (where, t["id"], len(qs), b["max_questions_per_task"]))
         owner = (t.get("assignees") or [None])[0]
+        question_deltas = []
+        effort_numeric = isinstance(t.get("effort_hours"), (int, float)) \
+            and not isinstance(t.get("effort_hours"), bool) \
+            and math.isfinite(t["effort_hours"])
         for j, q in enumerate(qs):
-            if "id" not in q:
-                errors.append("%s[%s]: questions[%d] needs an id" % (where, t["id"], j))
+            qid = q.get("id")
+            if not isinstance(qid, str) or not qid.strip():
+                errors.append("%s[%s]: questions[%d] needs a non-empty string id"
+                              % (where, t["id"], j))
+            elif q.get("gates"):
+                if qid in seen_question_ids:
+                    errors.append("%s[%s]: duplicate gating question id %r"
+                                  % (where, t["id"], qid))
+                seen_question_ids.add(qid)
             if not (start <= q.get("at", -1) <= horizon):
                 errors.append("%s[%s]: questions[%d].at outside run window"
                               % (where, t["id"], j))
@@ -136,8 +314,130 @@ def validate_scenario(scenario):
             if owner is not None and owner not in worker_ids:
                 errors.append("%s[%s]: a blocking question needs a worker owner, "
                               "got %r" % (where, t["id"], owner))
+            if q.get("gates"):
+                options = q.get("options")
+                if (not isinstance(options, list) or len(options) < 2
+                        or len(set(options)) != len(options)
+                        or any(not isinstance(x, str) or not x.strip()
+                               for x in options)):
+                    errors.append(
+                        "%s[%s]: questions[%d] needs at least two unique, "
+                        "non-empty string options" % (where, t["id"], j))
+                effects = q.get("choice_effects")
+                if effects is not None:
+                    option_set = set(options or [])
+                    if not isinstance(effects, dict) or set(effects) != option_set:
+                        errors.append("%s[%s]: questions[%d] choice_effects keys "
+                                      "must match options" % (where, t["id"], j))
+                    else:
+                        shapes = set()
+                        deltas = []
+                        for choice, effect in effects.items():
+                            if not isinstance(effect, dict) or set(effect) - {
+                                    "summary", "task_effort_delta_hours",
+                                    "capacity_costs"} or "summary" not in effect:
+                                errors.append("%s[%s]: questions[%d] choice %r "
+                                              "effect has bad fields"
+                                              % (where, t["id"], j, choice))
+                                continue
+                            if not isinstance(effect.get("summary"), str) \
+                                    or not effect["summary"].strip():
+                                errors.append("%s[%s]: questions[%d] choice %r "
+                                              "effect summary must be non-empty"
+                                              % (where, t["id"], j, choice))
+                            delta = effect.get("task_effort_delta_hours", 0)
+                            if not isinstance(delta, (int, float)) \
+                                    or isinstance(delta, bool) \
+                                    or not math.isfinite(delta):
+                                errors.append("%s[%s]: questions[%d] choice %r "
+                                              "effort delta must be finite"
+                                              % (where, t["id"], j, choice))
+                            else:
+                                deltas.append(delta)
+                                if "task_effort_delta_hours" in effect \
+                                        and not effort_numeric:
+                                    errors.append("%s[%s]: questions[%d] choice %r "
+                                                  "effort delta requires numeric effort_hours"
+                                                  % (where, t["id"], j, choice))
+                                elif effort_numeric and not (
+                                        b["min_task_effort_hours"]
+                                        <= t["effort_hours"] + delta
+                                        <= b["max_task_effort_hours"]):
+                                    errors.append("%s[%s]: questions[%d] choice %r "
+                                                  "effort delta leaves effort out of bounds"
+                                                  % (where, t["id"], j, choice))
+                            costs = effect.get("capacity_costs", [])
+                            if not isinstance(costs, list):
+                                errors.append("%s[%s]: questions[%d] choice %r "
+                                              "capacity_costs must be a list"
+                                              % (where, t["id"], j, choice))
+                                costs = []
+                            for cost in costs:
+                                if not isinstance(cost, dict) or set(cost) != {
+                                        "npc", "minutes", "reason"}:
+                                    errors.append("%s[%s]: questions[%d] choice %r "
+                                                  "capacity cost has bad fields"
+                                                  % (where, t["id"], j, choice))
+                                    continue
+                                if cost["npc"] not in worker_ids:
+                                    errors.append("%s[%s]: questions[%d] choice %r "
+                                                  "capacity cost targets non-worker %r"
+                                                  % (where, t["id"], j, choice,
+                                                     cost["npc"]))
+                                if not isinstance(cost["minutes"], int) \
+                                        or isinstance(cost["minutes"], bool) \
+                                        or not 1 <= cost["minutes"] <= 480:
+                                    errors.append("%s[%s]: questions[%d] choice %r "
+                                                  "capacity cost minutes must be 1..480"
+                                                  % (where, t["id"], j, choice))
+                                if not isinstance(cost["reason"], str) \
+                                        or not cost["reason"].strip():
+                                    errors.append("%s[%s]: questions[%d] choice %r "
+                                                  "capacity cost reason must be non-empty"
+                                                  % (where, t["id"], j, choice))
+                            shapes.add(json.dumps({
+                                "task_effort_delta_hours":
+                                    effect.get("task_effort_delta_hours", 0),
+                                "capacity_costs":
+                                    effect.get("capacity_costs", []),
+                            }, sort_keys=True))
+                        if len(deltas) == len(effects):
+                            question_deltas.append(deltas)
+                        if len(shapes) < 2:
+                            errors.append("%s[%s]: questions[%d] choice_effects "
+                                          "must differ across options"
+                                          % (where, t["id"], j))
+        if question_deltas and effort_numeric:
+            for combo in itertools.product(*question_deltas):
+                effective = t["effort_hours"] + sum(combo)
+                if not (b["min_task_effort_hours"] <= effective
+                        <= b["max_task_effort_hours"]):
+                    errors.append("%s[%s]: question choice deltas leave effort "
+                                  "out of bounds" % (where, t["id"]))
+                    break
+        if "stages" in t:
+            errors.extend(_validate_staged_parent(
+                t, where, b, worker_ids, known_ids))
+
+    try:
+        from .work import materialize_work_items
+        materialized = materialize_work_items(
+            [t for t in tasks] + [a["task"] for a in arrivals])
+        errors.extend(_validate_materialized(materialized, b, worker_ids))
+    except Exception as error:
+        errors.append("staged work materialization failed: %s" % error)
+
+    costs = scenario.get("costs") or {}
+    for key in ("handoff_minutes", "helper_onboarding_minutes"):
+        if key in costs and (not isinstance(costs[key], int)
+                             or isinstance(costs[key], bool)
+                             or not 0 <= costs[key] <= 480):
+            errors.append("costs.%s must be an integer in 0..480" % key)
 
     for i, arr in enumerate(arrivals):
+        if "stages" in arr.get("task", {}):
+            errors.append("task_arrivals[%d]: staged work is not supported "
+                          "in Phase 1" % i)
         if not (start <= arr["at"] <= horizon):
             errors.append("task_arrivals[%d]: at=%d outside run window" % (i, arr["at"]))
         if arr.get("npc") and arr["npc"] not in npc_ids:

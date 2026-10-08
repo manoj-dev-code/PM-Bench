@@ -43,6 +43,10 @@ def replay(scenario, events, until_seq=None):
             )
         elif e["kind"] == "task_added":
             world.tasks.append(e["task"])
+            if not e["task"].get("contingent"):
+                world.revealed_tasks.add(e["task"]["id"])
+        elif e["kind"] == "task_revealed":
+            world.revealed_tasks.add(e["task_id"])
         elif e["kind"] == "task_updated":
             t = world.find_task(e["task_id"])
             if t is not None:

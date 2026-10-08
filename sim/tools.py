@@ -10,7 +10,10 @@ world at the current instant (+1 sim-min cost) and may schedule async
 consequences. Time-advancing tools yield control to the queue.
 """
 
+import math
+
 from .sim_time import fmt
+from .temporal import record_forecast
 
 
 def _tool(name, description, properties, required, handler):
@@ -47,10 +50,11 @@ def _view_inbox(engine, args):
 
 def _view_calendar(engine, args):
     # calendars are EXPOSED truth (DESIGN.md information ledger): who is in
-    # what meeting when is public — capacity math stays the PM's job
+    # what meeting or out-of-office block when is public — capacity math stays
+    # the PM's job
     now = engine.world.clock
-    out = []
-    for m in sorted(engine.world.meetings, key=lambda m: m["start"]):
+    rows = []
+    for m in engine.world.meetings:
         if m.get("cancelled"):
             continue
         row = {"id": m["id"], "topic": m["topic"],
@@ -60,7 +64,17 @@ def _view_calendar(engine, args):
                           "now" if m["start"] <= now else "upcoming")}
         if m.get("task"):
             row["task"] = m["task"]
-        out.append(row)
+        rows.append((m["start"], row))
+    for npc in engine.world.scenario.get("npcs", []):
+        for i, (start, end) in enumerate(npc.get("ooo", [])):
+            rows.append((start, {
+                "id": "ooo-%s-%d" % (npc["id"], i),
+                "topic": "Out of office: %s" % npc["name"],
+                "start": fmt(start), "end": fmt(end),
+                "attendees": [npc["id"]], "type": "out_of_office",
+                "status": ("past" if end <= now else
+                           "now" if start <= now else "upcoming")}))
+    out = [row for _, row in sorted(rows, key=lambda item: item[0])]
     return {"now": engine.world.now(), "meetings": out}
 
 
@@ -68,6 +82,7 @@ def _advance(engine, minutes):
     # PM sleep semantics: push-class signals interrupt the advance (control
     # comes back at the interruption instant); board broadcasts never do.
     target = engine.world.clock + minutes
+    target = min(target, getattr(engine, "agent_horizon", target))
     fired = engine.advance_until(target, interruptible=True)
     out = {"fired": fired, "now": engine.world.now()}
     if engine.world.clock < target:
@@ -75,7 +90,28 @@ def _advance(engine, minutes):
     return out
 
 
+def _wait(engine):
+    horizon = min(engine.world.clock + 36 * 60,
+                  getattr(engine, "agent_horizon", engine.world.clock + 36 * 60))
+    return {"replied": engine.run_until_reply(horizon=horizon) is not None,
+            "now": engine.world.now()}
+
+
 TOOLS = [
+    _tool("forecast_completion",
+          "Record or revise a calibrated estimate of when a visible unfinished "
+          "task will complete. p50_completion_time and p90_completion_time are "
+          "absolute simulated minutes since Monday 00:00 (next Monday starts "
+          "at 10080), and p50 must be <= p90. Recording costs one minute. "
+          "Revisions are accepted only after new evidence or a plan change; "
+          "explain what changed in rationale.",
+          {"task_id": {"type": "string"},
+           "p50_completion_time": {"type": "integer", "minimum": 0},
+           "p90_completion_time": {"type": "integer", "minimum": 0},
+           "rationale": {"type": "string"}},
+          ["task_id", "p50_completion_time", "p90_completion_time",
+           "rationale"],
+          record_forecast),
     _tool("send_chat",
           "Send a chat message to one coworker (npc) or several (to) — a "
           "group ping where everyone sees who else is on it.",
@@ -96,6 +132,16 @@ TOOLS = [
            "body": {"type": "string"}},
           ["to", "subject", "body"],
           lambda e, a: e.agent_email(a["to"], a["subject"], a["body"])),
+
+    _tool("answer_question",
+          "Make an explicit decision on an open blocking question and deliver it to the current task owner. Generic chat/email messages do not unblock work.",
+          {"task_id": {"type": "string"},
+           "question_id": {"type": "string"},
+           "choice": {"type": "string"},
+           "rationale": {"type": "string"},
+           "via": {"type": "string", "enum": ["chat", "email"]}},
+          ["task_id", "question_id", "choice", "rationale", "via"],
+          lambda e, a: e.agent_answer_question(a["task_id"], a["question_id"], a["choice"], a["rationale"], a["via"])),
 
     _tool("add_task",
           "Add a TRACKING item to the project board (a note everyone can "
@@ -158,8 +204,8 @@ TOOLS = [
           "attend yourself. A transcript is kept. Optionally set 'task' to a "
           "task id to make it a working session on that task with those people.",
           {"attendees": {"type": "array", "items": {"type": "string"}},
-           "start_in_minutes": {"type": "integer"},
-           "duration_minutes": {"type": "integer"},
+           "start_in_minutes": {"type": "integer", "minimum": 0},
+           "duration_minutes": {"type": "integer", "minimum": 1},
            "topic": {"type": "string"},
            "agenda": {"type": "string"},
            "task": {"type": "string"}},
@@ -200,7 +246,7 @@ TOOLS = [
 
     _tool("view_inbox",
           "Read recent messages you've received.",
-          {"limit": {"type": "integer"}}, [], _view_inbox),
+          {"limit": {"type": "integer", "minimum": 1}}, [], _view_inbox),
 
     _tool("view_calendar",
           "See the team calendar: every meeting with its time and attendees.",
@@ -210,15 +256,14 @@ TOOLS = [
           "Let simulated time pass (you do nothing for N minutes); scheduled "
           "events fire along the way. Some things happening around you can "
           "interrupt you before the time is up.",
-          {"minutes": {"type": "integer"}}, ["minutes"],
+          {"minutes": {"type": "integer", "minimum": 0}}, ["minutes"],
           lambda e, a: _advance(e, int(a["minutes"]))),
 
     _tool("wait_for_reply",
           "Advance time until the next message reaches you — a chat, or an "
           "email landing in your inbox.",
           {}, [],
-          lambda e, a: {"replied": e.run_until_reply() is not None,
-                        "now": e.world.now()}),
+          lambda e, a: _wait(e)),
 ]
 
 BY_NAME = {t["name"]: t for t in TOOLS}
@@ -230,13 +275,55 @@ def schemas():
             for t in TOOLS]
 
 
+def _argument_error(value, schema, path="arguments"):
+    kind = schema.get("type")
+    valid = {
+        "object": lambda: isinstance(value, dict),
+        "array": lambda: isinstance(value, list),
+        "string": lambda: isinstance(value, str),
+        "boolean": lambda: isinstance(value, bool),
+        "integer": lambda: isinstance(value, int) and not isinstance(value, bool),
+        "number": lambda: isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value),
+    }
+    if kind in valid and not valid[kind]():
+        return "%s must be %s" % (path, kind)
+    if kind == "object":
+        for key in schema.get("required", []):
+            if key not in value:
+                return "%s.%s is required" % (path, key)
+        for key, item in value.items():
+            if key not in schema.get("properties", {}):
+                return "%s.%s is unknown" % (path, key)
+            error = _argument_error(item, schema["properties"][key], path + "." + key)
+            if error:
+                return error
+    if kind == "array":
+        for i, item in enumerate(value):
+            error = _argument_error(item, schema.get("items", {}), "%s[%d]" % (path, i))
+            if error:
+                return error
+    if "enum" in schema and value not in schema["enum"]:
+        return "%s must be one of %s" % (path, schema["enum"])
+    if "minimum" in schema and value < schema["minimum"]:
+        return "%s must be >= %s" % (path, schema["minimum"])
+    if "maximum" in schema and value > schema["maximum"]:
+        return "%s must be <= %s" % (path, schema["maximum"])
+    return None
+
+
 def call_tool(engine, name, args):
-    if name not in BY_NAME:
+    if engine.world.clock >= getattr(engine, "agent_horizon", float("inf")):
+        return {"error": "evaluation horizon reached"}
+    if not isinstance(name, str) or name not in BY_NAME:
         return {"error": "unknown tool %r" % name}
-    result = BY_NAME[name]["handler"](engine, args or {})
+    args = {} if args is None else args
+    error = _argument_error(args, BY_NAME[name]["input_schema"])
+    if error:
+        return {"error": error}
+    result = BY_NAME[name]["handler"](engine, args)
     # PUSH delivery (sim/signals.py): whatever landed on the PM unasked since
-    # the last tool call rides along with this result — chat interrupts you.
-    # Email never appears here: it waits in the inbox for check_email.
+    # the last tool call rides along with this result — chat and delivered email
+    # notifications both ride along.
     new = engine.drain_agent_push()
     if new:
         return {"result": result, "notifications": new}

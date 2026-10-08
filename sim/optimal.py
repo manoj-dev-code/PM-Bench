@@ -5,7 +5,8 @@
 The IDEALIZED relaxation — every friction at its best value:
   - communication free & instantaneous (full information at t=0)
   - skill multiplier 1x for everyone (any person can do any task)
-  - no meetings / interruption overhead (busy = {})
+  - no meetings / interruption overhead; authored OOO remains a hard
+    availability constraint
   - decisions cost nothing
 
 What remains are the HARD constraints: arrivals (a task can't start before
@@ -34,7 +35,8 @@ import json
 import sys
 
 from .rubric import DEFAULT_PRIORITY_WEIGHTS, load_rubric, task_value
-from .tasks import physics_of, task_view
+from .tasks import add_work_minutes, physics_of, task_view
+from .work import materialize_work_items
 
 
 def _all_tasks(scenario):
@@ -43,7 +45,7 @@ def _all_tasks(scenario):
              for t in (scenario.get("project") or {}).get("tasks", [])]
     for arr in scenario.get("task_arrivals", []):
         tasks.append(dict(arr["task"], arrival=arr["at"], source="external"))
-    return tasks
+    return materialize_work_items(tasks)
 
 
 def worker_ids(scenario):
@@ -58,6 +60,49 @@ def _skills_of(scenario):
     return {n["id"]: n["skills"] for n in scenario["npcs"] if n.get("skills")}
 
 
+def _hard_busy(scenario):
+    """Hard authored availability only — OOO, never cancellable meetings."""
+    return {n["id"]: [tuple(x) for x in n.get("ooo", [])]
+            for n in scenario.get("npcs", []) if n.get("worker", True)}
+
+
+def _choice_plans(tasks, base_busy):
+    """Cartesian product of gating-question options -> (choices, effects, busy)."""
+    questions = [(t["id"], q) for t in tasks for q in t.get("questions") or []
+                 if q.get("gates")]
+    plans = []
+    if not questions:
+        return [({}, {}, {k: list(v) for k, v in base_busy.items()})]
+    option_lists = [[(q["id"], choice) for choice in q.get("options") or [None]]
+                    for _, q in questions]
+    for picks in itertools.product(*option_lists):
+        choices = {}
+        effects = {}
+        busy = {k: list(v) for k, v in base_busy.items()}
+        costs = []
+        for (task_id, q), (question_id, choice) in zip(questions, picks):
+            choices[question_id] = choice
+            effect = (q.get("choice_effects") or {}).get(choice) or {}
+            if not effect:
+                continue
+            row = {"at": q["at"], "question_id": question_id,
+                   "choice": choice, "summary": effect.get("summary"),
+                   "task_effort_delta_hours":
+                       effect.get("task_effort_delta_hours", 0),
+                   "capacity_costs": list(effect.get("capacity_costs") or [])}
+            effects.setdefault(task_id, []).append(row)
+            for cost in row["capacity_costs"]:
+                costs.append((q["at"], len(costs), cost["npc"],
+                              cost["minutes"]))
+        for at, _, person, minutes in sorted(costs):
+            intervals = busy.setdefault(person, [])
+            start_at = add_work_minutes(at, 0, intervals)
+            intervals.append(
+                (start_at, add_work_minutes(start_at, minutes, intervals)))
+        plans.append((choices, effects, busy))
+    return plans
+
+
 def _greedy_assignments(free, workers, skills, weights):
     """A shortlist of near-optimal solo assignments for instances too big to
     search exhaustively — used only as the reference anchor, not a proof of
@@ -69,8 +114,10 @@ def _greedy_assignments(free, workers, skills, weights):
                   for t in free}
     load = {w: 0.0 for w in workers}
     balanced = {}
-    for t in sorted(free, key=lambda t: -(weights.get(t.get("priority") or "P2", 2)
-                                          * (t["effort_hours"] - t.get("done_hours", 0)))):
+    for t in sorted(free, key=lambda t: -(
+            weights.get(t.get("priority") or "P2", 2)
+            * t.get("score_weight_factor", 1.0)
+            * (t["effort_hours"] - t.get("done_hours", 0)))):
         pick = min(workers, key=lambda w: (-_person_skill_on(t, w, skills), load[w]))
         balanced[t["id"]] = pick
         load[pick] += t["effort_hours"] - t.get("done_hours", 0)
@@ -106,6 +153,7 @@ def opt_ideal(scenario, rubric=None, max_exhaustive=200000):
     instant_answers = {t["id"]: {q["id"]: q["at"] for q in t.get("questions") or []
                                  if q.get("gates")}
                        for t in tasks if t.get("questions")}
+    choice_plans = _choice_plans(tasks, _hard_busy(scenario))
 
     # OPT is the frictionless INDIVIDUAL-optimal reference: one best-skilled
     # owner per task, no friction, questions answered instantly. It is NOT a
@@ -122,16 +170,23 @@ def opt_ideal(scenario, rubric=None, max_exhaustive=200000):
     # correctness-critical ceiling. (Swarm is still bounded in the live world —
     # the per-day meeting cap + focus-tax + one-owner-at-a-time keep any real
     # overshoot small and finite.)
-    def evaluate(assignment, ordering):
-        # frictionless (busy={}) with REAL skills — the search routes each task
-        # to its fastest eligible worker; the agent's play is one point in this
-        # same (more-constrained, friction-bearing) space. `assignment` maps
-        # task-id -> worker.
+    def evaluate(assignment, ordering, decision_effects, busy):
+        # frictionless apart from authored hard busy/decision consequences, with
+        # REAL skills — the search routes each task to its fastest eligible
+        # worker; the agent's play is one point in this same constrained space.
+        # `assignment` maps task-id -> worker.
         candidate = [dict(t, assignees=[assignment[t["id"]]]) for t in ordering]
         rows = task_view(candidate + fixed, start, horizon,
-                         busy_by_assignee={}, skills=skills,
-                         answers=instant_answers, physics=physics_of(scenario))
+                         busy_by_assignee=busy, skills=skills,
+                         answers=instant_answers,
+                         physics=physics_of(scenario),
+                         decision_effects=decision_effects)
         return task_value(rows, tv_cfg, horizon, start, workers=workers)
+
+    def best_combined(assignment, ordering):
+        return max((evaluate(assignment, ordering, effects, busy)
+                    for _, effects, busy in choice_plans),
+                   key=lambda v: v["combined"])
 
     # three ceilings tracked in ONE search pass: each metric gets its own
     # maximum (the completion-optimal and efficiency-optimal assignments
@@ -140,7 +195,9 @@ def opt_ideal(scenario, rubric=None, max_exhaustive=200000):
     # candidate orderings: authored order + weight-descending (urgent-first
     # engine semantics make ordering matter for contended workers)
     orderings = [list(free)]
-    by_weight = sorted(free, key=lambda t: -weights.get(t.get("priority") or "P2", 2))
+    by_weight = sorted(
+        free, key=lambda t: -(weights.get(t.get("priority") or "P2", 2)
+                              * t.get("score_weight_factor", 1.0)))
     if [t["id"] for t in by_weight] != [t["id"] for t in free]:
         orderings.append(by_weight)
 
@@ -150,7 +207,7 @@ def opt_ideal(scenario, rubric=None, max_exhaustive=200000):
     # is a cheap REFERENCE anchor (the reward is affine-invariant to it), a
     # near-optimal greedy anchor on big weeks is fine — a slightly loose anchor
     # doesn't change any GRPO advantage, it just shifts the 0..1 label.
-    n_combos = len(workers) ** len(free) * len(orderings)
+    n_combos = len(workers) ** len(free) * len(orderings) * len(choice_plans)
     if n_combos <= max_exhaustive:
         candidates = [{t["id"]: w for t, w in zip(free, combo)}
                       for combo in itertools.product(workers, repeat=len(free))]
@@ -166,7 +223,7 @@ def opt_ideal(scenario, rubric=None, max_exhaustive=200000):
         n_eval = 0
         for seed in list(candidates):
             cur = dict(seed)
-            curv = evaluate(cur, ord0)["combined"]
+            curv = best_combined(cur, ord0)["combined"]
             n_eval += 1
             for _ in range(8):   # capped sweeps; converges well before this
                 improved = False
@@ -174,7 +231,7 @@ def opt_ideal(scenario, rubric=None, max_exhaustive=200000):
                     for w in workers:
                         if w == cur[tid]:
                             continue
-                        v = evaluate(dict(cur, **{tid: w}), ord0)["combined"]
+                        v = best_combined(dict(cur, **{tid: w}), ord0)["combined"]
                         n_eval += 1
                         if v > curv + 1e-9:
                             cur[tid] = w
@@ -186,15 +243,16 @@ def opt_ideal(scenario, rubric=None, max_exhaustive=200000):
         searched = -n_eval   # negative flags the greedy+local-search path
 
     best = {"completion": (-1.0, None), "efficiency": (-1.0, None),
-            "done_weight_rate": (-1.0, None), "combined": (-1.0, None, None)}
+            "done_weight_rate": (-1.0, None), "combined": (-1.0, None, None, None)}
     for ordering in orderings:
         for named in candidates:
-            v = evaluate(named, ordering)
-            for metric in ("completion", "efficiency", "done_weight_rate"):
-                if (v[metric] or 0) > best[metric][0]:
-                    best[metric] = (v[metric], named)
-            if v["combined"] > best["combined"][0]:
-                best["combined"] = (v["combined"], named, v)
+            for choices, effects, busy in choice_plans:
+                v = evaluate(named, ordering, effects, busy)
+                for metric in ("completion", "efficiency", "done_weight_rate"):
+                    if (v[metric] or 0) > best[metric][0]:
+                        best[metric] = (v[metric], named)
+                if v["combined"] > best["combined"][0]:
+                    best["combined"] = (v["combined"], named, v, choices)
     v_best = best["combined"][2]
     n_combos = searched
     return {
@@ -203,6 +261,7 @@ def opt_ideal(scenario, rubric=None, max_exhaustive=200000):
         "opt_done_weight_rate": best["done_weight_rate"][0],
         "opt_combined": best["combined"][0],
         "assignment": best["combined"][1],
+        "choices": best["combined"][3],
         "per_task": v_best["per_task"],
         # fairness OF the combined-optimal schedule — the reference point:
         # how balanced the week is under perfect play (chains can force
@@ -223,8 +282,10 @@ def main():
           % (result["opt_completion"], result["opt_efficiency"],
              result["opt_combined"], result["combos_searched"]))
     print("optimal assignment:", json.dumps(result["assignment"], indent=2))
+    if result.get("choices"):
+        print("optimal choices:", json.dumps(result["choices"], indent=2))
     for t in result["per_task"]:
-        print("  %-24s %s w=%d progress=%.0f%% done=%s completion=%.2f efficiency=%.2f"
+        print("  %-24s %s w=%.2f progress=%.0f%% done=%s completion=%.2f efficiency=%.2f"
               % (t["id"], t["priority"], t["weight"], t["progress"] * 100,
                  t["done"], t["completion"], t["efficiency"]))
 

@@ -96,6 +96,168 @@ class TestGates(unittest.TestCase):
     def test_valid_fixture_passes(self):
         self.assertEqual(validate_scenario(scenario()), [])
 
+    def test_blocking_question_requires_explicit_options(self):
+        s = scenario()
+        s["project"]["tasks"][0]["questions"] = [{
+            "id": "scope", "at": 600, "gates": True, "held_by": "ana",
+        }]
+        self.assertTrue(any("options" in e for e in validate_scenario(s)))
+        s["project"]["tasks"][0]["questions"][0]["options"] = ["cut", "keep"]
+        self.assertFalse(any("options" in e for e in validate_scenario(s)))
+
+    def test_choice_effects_must_be_real_distinct_consequences(self):
+        base = scenario()
+        base["project"]["tasks"][0]["questions"] = [{
+            "id": "scope", "at": 600, "gates": True, "held_by": "ana",
+            "options": ["cut", "keep"],
+            "choice_effects": {
+                "cut": {"summary": "cut", "task_effort_delta_hours": -2},
+                "keep": {"summary": "keep", "task_effort_delta_hours": 2}}}]
+        self.assertEqual(validate_scenario(base), [])
+
+        bad = scenario()
+        bad["project"]["tasks"][0]["questions"] = [
+            dict(base["project"]["tasks"][0]["questions"][0])]
+        bad["project"]["tasks"][0]["questions"][0]["choice_effects"] = {
+            "cut": {"summary": "cut", "task_effort_delta_hours": -2}}
+        self.assertTrue(any("keys" in e for e in validate_scenario(bad)))
+
+        same = scenario()
+        same["project"]["tasks"][0]["questions"] = [
+            dict(base["project"]["tasks"][0]["questions"][0])]
+        same["project"]["tasks"][0]["questions"][0]["choice_effects"] = {
+            "cut": {"summary": "different prose"},
+            "keep": {"summary": "but the same physical consequence"}}
+        self.assertTrue(any("differ" in e for e in validate_scenario(same)))
+
+        worker = scenario()
+        worker["project"]["tasks"][0]["questions"] = [
+            dict(base["project"]["tasks"][0]["questions"][0])]
+        worker["project"]["tasks"][0]["questions"][0]["choice_effects"]["cut"][
+            "capacity_costs"] = [{"npc": "vp", "minutes": 0, "reason": "x"}]
+        errors = validate_scenario(worker)
+        self.assertTrue(any("non-worker" in e for e in errors))
+        self.assertTrue(any("minutes" in e for e in errors))
+
+        nonfinite = scenario()
+        nonfinite["project"]["tasks"][0]["questions"] = [
+            dict(base["project"]["tasks"][0]["questions"][0])]
+        nonfinite["project"]["tasks"][0]["questions"][0]["choice_effects"][
+            "cut"]["task_effort_delta_hours"] = float("nan")
+        self.assertTrue(any("finite" in e for e in validate_scenario(nonfinite)))
+
+        bounds = scenario()
+        bounds["project"]["tasks"][0]["questions"] = [
+            dict(base["project"]["tasks"][0]["questions"][0])]
+        bounds["project"]["tasks"][0]["questions"][0]["choice_effects"][
+            "keep"]["task_effort_delta_hours"] = 100
+        self.assertTrue(any("out of bounds" in e
+                            for e in validate_scenario(bounds)))
+
+    def test_cumulative_choice_deltas_are_bounded(self):
+        s = scenario()
+        s["project"]["tasks"][0]["questions"] = [
+            {"id": "first", "at": 600, "gates": True, "held_by": "ana",
+             "options": ["cut-a", "keep-a"],
+             "choice_effects": {
+                 "cut-a": {"summary": "cut first",
+                           "task_effort_delta_hours": -19},
+                 "keep-a": {"summary": "keep first",
+                            "task_effort_delta_hours": 0}}},
+            {"id": "second", "at": 601, "gates": True, "held_by": "ana",
+             "options": ["cut-b", "keep-b"],
+             "choice_effects": {
+                 "cut-b": {"summary": "cut second",
+                           "task_effort_delta_hours": -19},
+                 "keep-b": {"summary": "keep second",
+                            "task_effort_delta_hours": 0}}}]
+        self.assertTrue(any("choice deltas" in e
+                            for e in validate_scenario(s)))
+
+    def test_choice_delta_on_tracking_task_is_rejected(self):
+        s = scenario()
+        task = s["project"]["tasks"][0]
+        task.pop("effort_hours")
+        task["questions"] = [{
+            "id": "scope", "at": 600, "gates": True, "held_by": "ana",
+            "options": ["cut", "keep"],
+            "choice_effects": {
+                "cut": {"summary": "cut",
+                        "task_effort_delta_hours": -1},
+                "keep": {"summary": "keep",
+                         "task_effort_delta_hours": 0}}}]
+        self.assertTrue(any("numeric effort_hours" in e
+                            for e in validate_scenario(s)))
+
+    def test_gating_question_ids_are_globally_unique(self):
+        s = scenario()
+        s["project"]["tasks"][0]["questions"] = [{
+            "id": "scope", "at": 600, "gates": True, "held_by": "ana",
+            "options": ["cut", "keep"]}]
+        s["project"]["tasks"][1]["questions"] = [{
+            "id": "scope", "at": 600, "gates": True, "held_by": "bo",
+            "options": ["cut", "keep"]}]
+        self.assertTrue(any("duplicate gating question id" in e
+                            for e in validate_scenario(s)))
+
+    def test_question_ids_must_be_nonempty_strings(self):
+        for bad_id in ("", ["scope"]):
+            s = scenario()
+            s["project"]["tasks"][0]["questions"] = [{
+                "id": bad_id, "at": 600, "gates": True, "held_by": "ana",
+                "options": ["cut", "keep"]}]
+            errors = validate_scenario(s)
+            self.assertTrue(any("non-empty string id" in e
+                                for e in errors), (bad_id, errors))
+
+    def test_setup_cost_knobs_are_bounded(self):
+        s = scenario()
+        s["costs"] = {"handoff_minutes": 45, "helper_onboarding_minutes": 30}
+        self.assertEqual(validate_scenario(s), [])
+        s["costs"]["handoff_minutes"] = 481
+        self.assertTrue(any("handoff_minutes" in e
+                            for e in validate_scenario(s)))
+
+    def test_opt_returns_best_choice_and_intent_consumes_it(self):
+        from sim.intent import _gating_questions
+        from sim.optimal import opt_ideal
+        s = scenario()
+        s["project"]["tasks"][0]["questions"] = [{
+            "id": "scope", "at": 600, "gates": True, "held_by": "ana",
+            "options": ["slow", "fast"],
+            "choice_effects": {
+                "slow": {"summary": "adds work",
+                         "task_effort_delta_hours": 2},
+                "fast": {"summary": "removes work",
+                         "task_effort_delta_hours": -2}}}]
+        opt = opt_ideal(s)
+        self.assertEqual(opt["choices"], {"scope": "fast"})
+        self.assertEqual(_gating_questions(s, opt["choices"]),
+                         [(600, "core", "scope", "fast")])
+
+    def test_opt_ignores_cancellable_meetings_but_not_ooo(self):
+        from sim.optimal import opt_ideal
+        base = scenario()
+        meeting = scenario()
+        meeting["meetings"] = [{
+            "id": "sync", "start": 600, "end": 780,
+            "attendees": ["ana", "bo"], "topic": "cancellable sync",
+            "agenda": ""}]
+        self.assertEqual(opt_ideal(meeting)["opt_combined"],
+                         opt_ideal(base)["opt_combined"])
+        ooo = scenario()
+        ooo["npcs"][0]["ooo"] = [[545, 1085]]
+        self.assertNotEqual(opt_ideal(ooo)["opt_combined"],
+                            opt_ideal(base)["opt_combined"])
+
+    def test_crunch_review_gate_validates(self):
+        with open("scenarios/crunch.json") as f:
+            s = json.load(f)
+        self.assertEqual(validate_scenario(s), [])
+        backfill = next(t for t in s["project"]["tasks"]
+                        if t["id"] == "data-backfill")
+        self.assertEqual(backfill["blocked_by"], ["migration-review"])
+
     def test_unowned_arrival_rejected(self):
         """The contract: real work always has an owner — arrivals must land
         assigned to a default holder, or the baseline is a strawman."""

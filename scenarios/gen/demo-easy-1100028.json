@@ -211,6 +211,7 @@
     "generator_version": 1
   },
   "band": {
+    "scored_with": "2458a86e1d93",
     "no_pm_baseline": {
       "combined": 33.352,
       "completion": 38.0,

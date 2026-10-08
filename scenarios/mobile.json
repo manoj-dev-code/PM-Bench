@@ -49,6 +49,10 @@
             "at": 1980,
             "gates": true,
             "held_by": "sam",
+            "options": [
+              "email-password-v1",
+              "oauth-social-v1"
+            ],
             "ping": "I need your call on the auth flow before I can lock the API contract: do we ship the new OAuth/social login for v1, or keep the simple email+password and add OAuth post-launch? The payments and sync endpoints hang off this decision and I'm blocked until you choose. One-line answer, but I can't move the API forward till I hear back."
           }
         ],
@@ -281,6 +285,7 @@
     }
   ],
   "band": {
+    "scored_with": "2458a86e1d93",
     "no_pm_baseline": {
       "combined": 14.856,
       "completion": 16.943,

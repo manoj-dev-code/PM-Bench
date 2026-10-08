@@ -51,6 +51,10 @@
             "at": 1980,
             "gates": true,
             "held_by": "maya",
+            "options": [
+              "single-multi-tenant-schema",
+              "per-tenant-databases"
+            ],
             "ping": "Blocked on the data model before I can lock the API: single multi-tenant schema or per-tenant DBs? Billing and sync both hang off it and I can't move the core until you decide."
           }
         ],
@@ -260,6 +264,10 @@
             "at": 1980,
             "gates": true,
             "held_by": "leo",
+            "options": [
+              "single-region-with-later-failover",
+              "multi-region-at-launch"
+            ],
             "ping": "Blocked on a launch-infra decision only you/product can make: multi-region (safer, +a day) or single-region for v2 with failover later? The rollout forks here and I can't finish infra until you choose."
           }
         ],
@@ -564,6 +572,7 @@
     }
   ],
   "band": {
+    "scored_with": "2458a86e1d93",
     "no_pm_baseline": {
       "combined": 43.64,
       "completion": 50.473,

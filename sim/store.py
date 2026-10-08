@@ -76,5 +76,12 @@ class RunStore:
         self._llm_f.flush()
 
     def close(self):
-        self._f.close()
-        self._llm_f.close()
+        for stream in (self._f, self._llm_f):
+            if not stream.closed:
+                stream.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

@@ -51,6 +51,10 @@
             "at": 665,
             "gates": true,
             "held_by": "sam",
+            "options": [
+              "shared-accounts-table",
+              "per-product-tables"
+            ],
             "ping": "Blocked before I can lock the core: one shared accounts table or split per-product tables? Exports and sync both hang off it and I can't move the core until you decide. Sitting idle till I hear back."
           }
         ],
@@ -368,7 +372,7 @@
     }
   ],
   "band": {
-    "scored_with": "5ab427cc8e20",
+    "scored_with": "2458a86e1d93",
     "no_pm_baseline": {
       "combined": 31.171,
       "completion": 33.84,

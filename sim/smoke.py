@@ -290,17 +290,16 @@ def _mig(scenario):
 
 
 def _answer_open_questions(eng):
-    """Simulate a reasonable PM promptly answering every blocking question (a
-    direct agent->owner chat at each question's open-time), so a projection can
-    test an UNRELATED mechanic without a question stall confounding it."""
-    from .world import Message
+    """Simulate a reasonable PM promptly answering every blocking question, so
+    a projection can test an unrelated mechanic without a question stall."""
     for t in eng.world.tasks:
         for q in t.get("questions") or []:
             if q.get("gates"):
-                owner = (t.get("assignees") or [None])[0]
-                eng.world.messages.append(
-                    Message(len(eng.world.messages), q["at"], "agent", owner,
-                            "answered", "chat"))
+                eng.world.record("question_answered", task_id=t["id"],
+                                 question_id=q["id"], choice="proceed",
+                                 rationale="smoke", via="chat",
+                                 owner=(t.get("assignees") or [None])[0],
+                                 delivered_at=q["at"])
 
 
 def check_meeting_swarm(scenario):
@@ -330,12 +329,12 @@ def check_meeting_swarm(scenario):
     succ = next((r["id"] for r in base.values()
                  if tid in (r.get("blocked_by") or [])), None)
 
-    at = 1980  # Tue 09:00 — a full 180-min block inside working hours + cap
+    at = 2220  # Tue 13:00 — a 150-min block using the remaining daily cap
     swarmed = project(lambda e: e.agent_schedule_meeting(
-        [owner, helper], at, 180, "swarm", task=tid))
+        [owner, helper], at, 150, "swarm", task=tid))
     # owner absent: same room minus the doer -> must bank nothing
     absent = project(lambda e: e.agent_schedule_meeting(
-        [helper], at, 180, "no-doer", task=tid))
+        [helper], at, 150, "no-doer", task=tid))
 
     b_done, s_done = base[tid]["projected_done"], swarmed[tid]["projected_done"]
     if not (s_done and b_done and s_done < b_done):
@@ -369,7 +368,7 @@ def check_meeting_ops(scenario):
 
     # a future swarm, then cancel it -> the task projection reverts to no-swarm
     base = {r["id"]: r for r in eng.world.tasks_view(at=horizon)}
-    m = eng.agent_schedule_meeting([owner, helper], 1980, 180, "swarm", task=tid)
+    m = eng.agent_schedule_meeting([owner, helper], 2220, 150, "swarm", task=tid)
     if "id" not in m:
         return False, "scheduling a swarm failed: %s" % m
     if eng.world.tasks_view(at=horizon)[0] is None:
@@ -390,8 +389,8 @@ def check_meeting_ops(scenario):
 
     # double-booking one person into overlapping meetings is rejected
     eng2 = _engine(scenario)
-    eng2.agent_schedule_meeting([owner], 1980, 120, "a")
-    dbl = eng2.agent_schedule_meeting([owner], 1980 + 60, 120, "b")
+    eng2.agent_schedule_meeting([owner], 2220, 120, "a")
+    dbl = eng2.agent_schedule_meeting([owner], 2220 + 60, 120, "b")
     if "error" not in dbl:
         return False, "allowed a double-booking overlap"
 
@@ -401,7 +400,7 @@ def check_meeting_ops(scenario):
     ok_min = 0
     capped = None
     for k in range(12):
-        r = eng3.agent_schedule_meeting([helper], 1980 + k * 60, 60, "m%d" % k)
+        r = eng3.agent_schedule_meeting([helper], 2220 + k * 60, 60, "m%d" % k)
         if "error" in r:
             capped = r
             break
@@ -456,15 +455,14 @@ def check_parallel_work(_scenario):
 
 
 def check_blocking_question(scenario):
-    """A gating question SUSPENDS its owner's task from open-time until the PM's
-    reply is DELIVERED — and the CHANNEL sets the latency: chat unblocks now,
-    email only at the next answer-batch tick. Asserts the full derived path
-    (World.question_answers from the message log -> scheduler gate):
+    """A gating question SUSPENDS its owner's task from open-time until an
+    explicit decision is DELIVERED — and the CHANNEL sets the latency: chat
+    unblocks now, email only at the next answer-batch tick. Asserts the full
+    derived path (World.question_answers -> scheduler gate):
       - never answered  -> task frozen at its open-time progress
       - chat answer      -> resumes immediately (most progress by Friday)
       - email answer     -> resumes later than chat (strictly less progress)
-      - reply to the WRONG person doesn't resolve it (owner-specific)."""
-    from .world import Message
+      - a WRONG question id doesn't resolve it (explicit-decision scoped)."""
     # locate a gating question in the scenario
     found = None
     for t in scenario.get("project", {}).get("tasks", []):
@@ -482,12 +480,19 @@ def check_blocking_question(scenario):
 
     email_lands = (at // batch + 1) * batch   # the async cost: next grid tick
 
-    def run(reply_via, to=None):
+    def run(reply_via):
         eng = _engine(scenario)
-        if reply_via:
-            eng.world.messages.append(
-                Message(len(eng.world.messages), at, "agent", to or owner,
-                        "here's your call", reply_via))
+        if reply_via in ("chat", "email"):
+            eng.world.record("question_answered", task_id=tid,
+                             question_id=qid, choice="proceed",
+                             rationale="smoke", via=reply_via, owner=owner,
+                             delivered_at=(at if reply_via == "chat"
+                                           else email_lands))
+        elif reply_via == "wrong":
+            eng.world.record("question_answered", task_id=tid,
+                             question_id="different-question", choice="proceed",
+                             rationale="smoke", via="chat", owner=owner,
+                             delivered_at=at)
         def at_t(when, key):
             return {x["id"]: x for x in eng.world.tasks_view(at=when)}[tid][key]
         return {
@@ -499,7 +504,7 @@ def check_blocking_question(scenario):
     never = run(None)
     chat = run("chat")
     email = run("email")
-    wrong = run("chat", to=helper_of(scenario, owner))
+    wrong = run("wrong")
 
     # just after the open-time: chat has already unblocked, email/never haven't
     if not (chat["probe_status"] == "in_progress"
@@ -518,7 +523,7 @@ def check_blocking_question(scenario):
         return False, ("stall not lost work — Fri never=%.1f email=%.1f chat=%.1f"
                        % (never["fri"], email["fri"], chat["fri"]))
     if abs(wrong["fri"] - never["fri"]) > 1e-6:
-        return False, "reply to the wrong person resolved the block (not owner-scoped)"
+        return False, "answer for the wrong question resolved the block"
     return True, ("chat unblocks now vs email at +%dmin (head-start %.1f>%.1f h) "
                   "vs never-stalled (Fri +%.1f h over never)"
                   % (email_lands - at, chat["mid"], email["mid"],

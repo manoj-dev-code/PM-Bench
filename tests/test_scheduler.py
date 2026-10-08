@@ -3,15 +3,33 @@
 import unittest
 
 from sim.tasks import task_view
+from sim.tools import call_tool
 from sim.world import Message, World
 
-from tests.fixtures import scenario
+from tests.fixtures import HORIZON, make_engine, scenario
 
 START = 545
 
 
 def _view(tasks, now, busy=None):
     return {r["id"]: r for r in task_view(tasks, START, now, busy or {})}
+
+
+class TestMeetingContributors(unittest.TestCase):
+    def _projected_done(self, attendees):
+        eng = make_engine()
+        call_tool(eng, "schedule_meeting",
+                  {"attendees": attendees, "start_in_minutes": 120,
+                   "duration_minutes": 120, "topic": "core swarm",
+                   "task": "core"})
+        return {r["id"]: r for r in eng.world.tasks_view(at=HORIZON)}["core"]["projected_done"]
+
+    def test_only_workers_contribute_meeting_labor(self):
+        owner_only = self._projected_done(["ana"])
+        synthetic = self._projected_done(["ana", "agent", "vp"])
+        workers = self._projected_done(["ana", "bo"])
+        self.assertEqual(synthetic, owner_only)
+        self.assertLess(workers, owner_only)
 
 
 class TestOrdering(unittest.TestCase):

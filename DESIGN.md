@@ -231,6 +231,29 @@ resulting work segments, so true progress is answerable at any instant.
   since the 11:30 arrival — which made acting early worthless.)
   Reassignment persists progress-so-far into `done_hours` at handoff:
   prior work is kept, never re-credited.
+- **Decision effects — deterministic option consequences.** A gating
+  question may author `choice_effects`: an option-specific remaining-effort
+  delta and/or named-person capacity cost. `answer_question` pins the whole
+  effect into `question_answered`; nothing mutates until `delivered_at`, so
+  a chat choice lands now while an email choice lands on the answer batch.
+  At delivery the scheduler adds one static decision point, applies the
+  delta exactly once, and serializes capacity costs around meetings, OOO,
+  nights, and prior interruptions. Open-question tracker rows may expose
+  each option's authored summary as `tradeoffs`.
+- **Setup costs — coordination consumes capacity.** Optional scenario
+  `costs.handoff_minutes` and `costs.helper_onboarding_minutes` record the
+  same `capacity_cost` event when ownership changes or a helper joins. The
+  new owner/helper pays the configured working minutes; dropping a helper
+  and same-owner no-op assignment pay nothing.
+- **Staged work and quality gates.** A staged seed work item materializes
+  into ordinary scheduler tasks (`item::stage`) in authored order. A
+  deterministic `quality_gate.outcome=rework` pre-materializes a contingent
+  rework stage after the gate; it is in ground truth but hidden from tracker,
+  beliefs, forecasts, meetings, and mutations until the gate truly completes.
+  Completion emits `task_revealed` with the authored reason, wakes
+  interruptible advance, and notifies the rework owner. Stage
+  `score_weight_factor`s sum to 1.0, so a staged item keeps exactly one
+  authored task's rubric weight.
 - **`reprioritize` — ordering without minting.** The PM appends a
   timestamped `order_event` (working priority P0–P3 and/or urgency) to any
   filed task. Applied **forward-only** — a Thursday reprioritization can
@@ -404,6 +427,16 @@ discovery, and record hygiene are deliberately unscored; their value flows
 through outcomes. Behavioral readouts live in `navigation.json` (tool mix,
 channel mix, contact patterns): telemetry, never reward.
 
+**Calibrated forecasting** is a separate temporal axis, never outcome reward.
+`forecast_completion` records a p50/p90 interval in absolute simulated minutes
+(`p50 <= p90`) plus a rationale; recording costs one action minute and is not
+accepted if that minute crosses the horizon or task completion. For an observed
+completion, signed error is actual minus prediction in work minutes; p50 drives
+the backward-compatible MAE/bias fields, while p90 coverage, interval width,
+and q=0.5/q=0.9 pinball loss measure calibration. Censored forecasts contribute
+interval width but no error, coverage, or pinball term. Legacy
+`completion_time` events regrade as a zero-width p50=p90 interval.
+
 ## 11. Task authoring and difficulty
 
 The authoring loop is config-iteration with analytic gates — seconds per
@@ -473,6 +506,14 @@ the agent is never shown the evaluation.
 Each run writes `meta.json` (probe, model, task = scenario name),
 `navigation.json` (how it moved: tool/channel mix, act-vs-yield, contact
 per NPC, sim-time coverage), and `scorecard.json`.
+
+`meta.json` also pins a `benchmark_identity`: canonical SHA-256 hashes of the
+semantic scenario, physics source, evidence renderer (+ NPC mode), and pinned
+rubric form `task_version`; `task_version + resolved model` forms the
+benchmark `coordinate`. Aggregation and the dashboard never pool incompatible
+task or environment versions. Launch aliases are labels only — the resolved
+model ID is the comparison identity. Legacy runs derive `legacy:*` identity
+from their pinned scorecard rather than current source.
 
 ## 13. Observability
 

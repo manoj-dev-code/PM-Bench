@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .signals import delivery
 from .sim_time import fmt
+from .work import materialize_work_items, work_item_terminals
 
 
 @dataclass
@@ -33,7 +34,7 @@ class World:
         # holder belief (belief_pct/belief_note, matures via belief_update
         # events), tracker (reported — what's recorded). The initial belief
         # entry (no "at") applies at load.
-        self.tasks = []
+        seed_tasks = []
         for t in (self.project or {}).get("tasks", []):
             t = dict(t, arrival=self.start_time, source="seed")
             beliefs = t.get("belief") or []
@@ -51,7 +52,11 @@ class World:
                     t["belief_remaining"] = belief_hours_left(
                         beliefs[0], t.get("effort_hours"))
                     t["belief_note"] = beliefs[0].get("note", "")
-            self.tasks.append(t)
+            seed_tasks.append(t)
+        self.work_item_terminals = work_item_terminals(seed_tasks)
+        self.tasks = materialize_work_items(seed_tasks)
+        self.revealed_tasks = {t["id"] for t in self.tasks
+                               if not t.get("contingent")}
         self.completed_announced = set()  # completions made public so far
         # meetings already on the calendar at week start (authored). A meeting
         # labelled to a task swarms it (boost); an unlabelled / wrong-room one
@@ -79,7 +84,11 @@ class World:
             tid = "%s-%d" % (base, n)
             n += 1
         spec["id"] = tid
+        spec["blocked_by"] = [self.work_item_terminals.get(dep, dep)
+                              for dep in spec.get("blocked_by", [])]
         self.tasks.append(spec)
+        if not spec.get("contingent"):
+            self.revealed_tasks.add(tid)
         self.record("task_added", task=spec, source=source)
         return spec
 
@@ -95,6 +104,13 @@ class World:
 
     def find_task(self, task_id):
         return next((t for t in self.tasks if t["id"] == task_id), None)
+
+    def task_visible(self, task_or_id):
+        """Whether the PM may see/act on this materialized task now."""
+        task = (self.find_task(task_or_id) if isinstance(task_or_id, str)
+                else task_or_id)
+        return task is not None and (not task.get("contingent")
+                                     or task["id"] in self.revealed_tasks)
 
     # -- meetings / transcripts / docs --------------------------------------
 
@@ -154,40 +170,62 @@ class World:
 
     def busy_by_assignee(self):
         """Time that doesn't go to tasks, per person — all derived, replayable:
-        - meetings consume their full block for every attendee
-        - each CHAT message received by a WORKER in working hours costs a
-          refocus tax (`costs.chat_interrupt_minutes`, default 20 min), and
-          interruptions SERIALIZE — three pings in three minutes are three full
-          distractions, not one. Email is exempt: it waits for the wakeup
-          batch; that's its advantage. Setting the tax to 0 makes chat free.
+        - meetings and OOO consume their fixed blocks for every attendee
+        - each working-hours CHAT to a WORKER costs the refocus tax
+        - logged setup costs and delivered choice costs consume work minutes.
 
-        The tax applies ONLY to workers (people with scored tasks): a
-        stakeholder you report to (worker:false) owns no work, so interrupting
-        them consumes no schedulable capacity — messaging the VP is free, and
-        the model says so rather than charging a tax it would then ignore."""
+        Variable costs are serialized per person: they pause around meetings,
+        OOO, nights, weekends, and earlier interruptions instead of collapsing
+        into overlapping dead time."""
         from .sim_time import in_working_hours
-        tax = self.scenario.get("costs", {}).get("chat_interrupt_minutes", 20)
+        from .tasks import add_work_minutes
+        costs = self.scenario.get("costs", {})
+        tax = costs.get("chat_interrupt_minutes", 20)
         workers = {n["id"] for n in self.scenario.get("npcs", [])
                    if n.get("worker", True)}
-        busy = {}
+        fixed, variable = {}, {}
         # OUT-OF-OFFICE: authored blocks (PTO, another project, an offsite) when a
         # person is simply unavailable — no task work, and no meeting can be booked
         # over them. A per-person partial-availability knob, replayable from config.
         for n in self.scenario.get("npcs", []):
             for iv in n.get("ooo", []):
-                busy.setdefault(n["id"], []).append((iv[0], iv[1]))
+                fixed.setdefault(n["id"], []).append((iv[0], iv[1]))
         for m in self.meetings:
             if m.get("cancelled"):
                 continue  # a cancelled meeting never happens — frees the block
             for a in m["attendees"]:
-                busy.setdefault(a, []).append((m["start"], m["end"]))
-        last_end = {}
+                fixed.setdefault(a, []).append((m["start"], m["end"]))
+
         for msg in self.messages:
             if (msg.via == "chat" and msg.recipient in workers and tax
                     and in_working_hours(msg.time)):
-                start = max(msg.time, last_end.get(msg.recipient, 0))
-                busy.setdefault(msg.recipient, []).append((start, start + tax))
-                last_end[msg.recipient] = start + tax
+                variable.setdefault(msg.recipient, []).append(
+                    (msg.time, msg.id, 0, tax))
+
+        for event in self.log:
+            if event["kind"] == "capacity_cost":
+                person = event.get("person")
+                if person in workers:
+                    variable.setdefault(person, []).append(
+                        (event["t"], event["seq"], 0, event["minutes"]))
+            elif event["kind"] == "question_answered":
+                for j, cost in enumerate(
+                        (event.get("effect") or {}).get("capacity_costs") or []):
+                    person = cost.get("npc")
+                    if person in workers:
+                        variable.setdefault(person, []).append(
+                            (event["delivered_at"], event["seq"], j,
+                             cost["minutes"]))
+
+        busy = {p: list(ivs) for p, ivs in fixed.items()}
+        for person, items in variable.items():
+            basis = list(fixed.get(person, []))
+            out = busy.setdefault(person, [])
+            for start, _seq, _sub, minutes in sorted(items):
+                start = add_work_minutes(start, 0, basis)
+                end = add_work_minutes(start, minutes, basis)
+                out.append((start, end))
+                basis.append((start, end))
         return busy
 
     def meetings_for(self, npc_id):
@@ -222,10 +260,12 @@ class World:
         for t in self.tasks:
             if t.get("arrival", self.start_time) > self.clock:
                 continue
+            if not self.task_visible(t):
+                continue
             if t.get("filed") is False:
                 continue  # announced to the PM but never filed: not on the board
             done = t["id"] in self.completed_announced
-            out.append({
+            row = {
                 "id": t["id"],
                 "title": t["title"],
                 "assignees": t.get("assignees", []),
@@ -236,7 +276,28 @@ class World:
                 "status": "done" if done else
                           ("unowned" if not t.get("assignees") else "open"),
                 "tracker_says": t.get("reported", ""),
-            })
+            }
+            answered = self.question_answers().get(t["id"], {})
+            open_questions = []
+            for q in t.get("questions") or []:
+                if not (q.get("gates") and q["at"] <= self.clock
+                        and (q["id"] not in answered
+                             or answered[q["id"]] > self.clock)):
+                    continue
+                qrow = {"id": q["id"], "prompt": q.get("ping", ""),
+                        "options": list(q.get("options") or [])}
+                effects = q.get("choice_effects")
+                if effects:
+                    qrow["tradeoffs"] = {
+                        choice: (effects[choice] or {}).get("summary", "")
+                        for choice in qrow["options"]}
+                open_questions.append(qrow)
+            if open_questions:
+                row["open_questions"] = open_questions
+            for key in ("work_item_id", "stage_id", "stage_kind"):
+                if key in t:
+                    row[key] = t[key]
+            out.append(row)
         return out
 
     def belief_view(self, npc_id):
@@ -251,6 +312,8 @@ class World:
             if npc_id not in t.get("assignees", []):
                 continue
             if t.get("arrival", self.start_time) > self.clock:
+                continue
+            if not self.task_visible(t):
                 continue
             if t["id"] in self.completed_announced:
                 out.append({"task": t["title"], "your_view": "done"})
@@ -267,7 +330,9 @@ class World:
                 row = next((r for r in self.tasks_view() if r["id"] == t["id"]), None)
                 td = row["true_done_hours"] if row and row.get("true_done_hours") \
                     is not None else t.get("done_hours", 0)
-                left = max(0.0, t.get("effort_hours", 0) - td)
+                effort = row.get("effort_hours") if row \
+                    else t.get("effort_hours", 0)
+                left = max(0.0, (effort or 0) - td)
                 view = "~%.0fh of work left" % left
             out.append({"task": t["title"], "your_view": view})
         return out
@@ -288,6 +353,8 @@ class World:
         from .tasks import physics_of, swarm_rate, work_minutes_between
         sk = self.skills()
         phys = physics_of(self.scenario)
+        workers = {n["id"] for n in self.scenario.get("npcs", [])
+                   if n.get("worker", True)}
         out = {}
         for m in self.meetings:
             tid = m.get("task")
@@ -300,7 +367,8 @@ class World:
             if owner not in m["attendees"]:
                 continue  # the doer wasn't in the room — no work happens on T
             dur = work_minutes_between(m["start"], m["end"])
-            dep = dur * swarm_rate(t, m["attendees"], sk, phys)
+            contributors = [a for a in m["attendees"] if a in workers]
+            dep = dur * swarm_rate(t, contributors, sk, phys)
             if dep > 0:
                 out.setdefault(tid, []).append((m["end"], dep))
         return out
@@ -316,7 +384,8 @@ class World:
                                  self.busy_by_assignee(), self.skills(),
                                  self.meeting_deposits(),
                                  answers=self.question_answers(),
-                                 physics=physics_of(self.scenario))
+                                 physics=physics_of(self.scenario),
+                                 decision_effects=self.decision_effects())
         spans = {}
         for tid, info in sched.items():
             t = self.find_task(tid)
@@ -329,28 +398,32 @@ class World:
                 for p, v in spans.items()}
 
     def question_answers(self):
-        """{task_id: {question_id: answered_at}} — when the PM's reply to each
-        BLOCKING question was DELIVERED to its owner. Derived (replayable) from
-        the message log + config, like meeting_deposits(): the FIRST agent->owner
-        message at/after a question's open-time answers it, and the delivery time
-        is the channel latency — chat lands instantly, email waits for the next
-        answer-batch tick (the async cost the PM is trading against the chat
-        focus-tax). A question with no reply yet stays unanswered (stalled)."""
-        batch = self.scenario.get("answer_batch_minutes", 120)
+        """{task_id: {question_id: delivered_at}} from explicit decisions."""
         out = {}
-        for t in self.tasks:
-            owner = (t.get("assignees") or [None])[0]
-            for q in t.get("questions") or []:
-                if not q.get("gates"):
-                    continue
-                reply = next((m for m in self.messages
-                              if m.sender == "agent" and m.recipient == owner
-                              and m.time >= q["at"]), None)
-                if reply is None:
-                    continue
-                delivered = (reply.time if reply.via == "chat"
-                             else (reply.time // batch + 1) * batch)
-                out.setdefault(t["id"], {})[q["id"]] = delivered
+        for event in self.log:
+            if event["kind"] != "question_answered":
+                continue
+            out.setdefault(event["task_id"], {}).setdefault(
+                event["question_id"], event["delivered_at"])
+        return out
+
+    def decision_effects(self):
+        """{task_id: [delivered choice effects]} folded from the event log."""
+        out = {}
+        for event in self.log:
+            if event["kind"] != "question_answered":
+                continue
+            effect = event.get("effect") or {}
+            if not effect:
+                continue
+            row = {"at": event["delivered_at"],
+                   "question_id": event["question_id"],
+                   "choice": event["choice"],
+                   "summary": effect.get("summary"),
+                   "task_effort_delta_hours":
+                       effect.get("task_effort_delta_hours", 0),
+                   "capacity_costs": list(effect.get("capacity_costs") or [])}
+            out.setdefault(event["task_id"], []).append(row)
         return out
 
     def tasks_view(self, at=None):
@@ -362,7 +435,8 @@ class World:
                          self.clock if at is None else at,
                          self.busy_by_assignee(), self.skills(),
                          self.meeting_deposits(), answers=self.question_answers(),
-                         physics=physics_of(self.scenario))
+                         physics=physics_of(self.scenario),
+                         decision_effects=self.decision_effects())
 
     def task_done(self, task_id, at=None):
         if not self.tasks:
@@ -372,7 +446,8 @@ class World:
                          self.clock if at is None else at, task_id,
                          self.busy_by_assignee(), self.skills(),
                          self.meeting_deposits(), answers=self.question_answers(),
-                         physics=physics_of(self.scenario))
+                         physics=physics_of(self.scenario),
+                         decision_effects=self.decision_effects())
 
     # -- the sim clock: one owner, one mutation point, monotonic ------------
 

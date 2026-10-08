@@ -25,6 +25,7 @@ Every number is deterministic and reproducible from the run dir forever.
 """
 
 import glob
+import copy
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ from .optimal import opt_ideal, worker_ids
 from .replay import load_run, replay
 from .rubric import load_rubric, task_value
 from .sim_time import fmt
+from .temporal import temporal_metrics
 
 
 def scoring_version():
@@ -46,7 +48,8 @@ def scoring_version():
     h = hashlib.sha256()
     here = os.path.dirname(__file__)
     for name in ("tasks.py", "rubric.py", "optimal.py", "eval.py",
-                 "world.py", "replay.py"):
+                 "world.py", "replay.py", "engine.py", "npc.py", "sim_time.py",
+                 "signals.py", "validate.py", "temporal.py", "work.py"):
         try:
             with open(os.path.join(here, name), "rb") as f:
                 h.update(f.read())
@@ -86,11 +89,19 @@ def build_baseline(scenario, rubric, run_dir):
     import tempfile
     from .engine import Engine
     tmp = tempfile.mkdtemp(prefix="pmsim-baseline-")
+    eng = None
     try:
-        eng = Engine(scenario, client=StubClient(), verbose=False, run_dir=tmp)
+        # Regrading a copied run must not depend on today's working directory
+        # or on a mutable rubric at the original source path.
+        pinned = copy.deepcopy(scenario)
+        pinned.pop("rubric", None)
+        pinned["evaluation"] = rubric
+        eng = Engine(pinned, client=StubClient(), verbose=False, run_dir=tmp)
         eng.advance_until(rubric["horizon"], max_events=2000)
         return eng.world
     finally:
+        if eng is not None:
+            eng.world.store.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -101,7 +112,8 @@ def evaluate(run_dir):
     tv_cfg = rubric.get("task_value", {})
     start = scenario.get("start_time", 545)
 
-    agent_world = replay(scenario, events)
+    # Later assignments/cancellations must not rewrite the world being graded.
+    agent_world = replay(scenario, [e for e in events if e["t"] <= horizon])
     baseline_world = build_baseline(scenario, rubric, run_dir)
 
     workers = worker_ids(scenario)
@@ -154,6 +166,9 @@ def evaluate(run_dir):
         "scored_with": scoring_version(),   # stale-cache guard (see above)
         "horizon": horizon,
         "horizon_fmt": fmt(horizon),
+        "observed_through": max([start] + [e["t"] for e in events]),
+        "complete": any(e["t"] >= horizon for e in events),
+        "temporal": temporal_metrics(agent_world, horizon),
         "degenerate": score is None,
         "reward": reward,
         "completion": ladder("completion", "opt_completion"),
@@ -170,6 +185,7 @@ def evaluate(run_dir):
         "utilization": v_agent["utilization"],
         "per_task_agent": v_agent["per_task"],
         "opt_assignment": opt["assignment"],
+        "opt_choices": opt.get("choices", {}),
         # the headline scalar, in [<=1], anchored 0=baseline 1=OPT
         "score": score,
         # odds-form headline: gain per unit of remaining regret (monotone in
@@ -213,7 +229,7 @@ def print_scorecard(result):
 
     print("\nper task (agent run):")
     for t in result["per_task_agent"]:
-        print("  %-24s %s w=%d %3.0f%%%s  compl=%.2f eff=%.2f"
+        print("  %-24s %s w=%.2f %3.0f%%%s  compl=%.2f eff=%.2f"
               % (t["id"], t["priority"], t["weight"], t["progress"] * 100,
                  " done" if t["done"] else "     ", t["completion"], t["efficiency"]))
     if result["score"] is not None:
@@ -223,6 +239,23 @@ def print_scorecard(result):
               % (result["score"], odds))
     else:
         print("\nSCORE: n/a (degenerate scenario: nothing winnable beyond baseline)")
+    timing = result["temporal"]
+    mae = ("%.1f work-min" % timing["p50_final_mae_work_minutes"]
+           if timing["p50_final_mae_work_minutes"] is not None else "n/a")
+    p90 = ("%.1f%%" % (timing["p90_coverage"] * 100)
+           if timing["p90_coverage"] is not None else "n/a")
+    width = ("%.1f work-min" % timing["mean_interval_width_work_minutes"]
+             if timing["mean_interval_width_work_minutes"] is not None else "n/a")
+    accuracy = ("%.1f%%" % (timing["horizon_accuracy"] * 100)
+                if timing["horizon_accuracy"] is not None else "n/a")
+    revision = ("%.1f%%" % (timing["belief_revision_coverage"] * 100)
+                if timing["belief_revision_coverage"] is not None else "n/a")
+    print("TIME: coverage %d/%d | forecasts %d (%d revisions) | p50 final MAE %s | "
+          "p90 coverage %s | mean interval %s | belief-update coverage %s | "
+          "by-horizon accuracy %s | censored %d"
+          % (timing["forecasted_tasks"], timing["eligible_tasks"],
+             timing["forecast_count"], timing["revision_count"], mae, p90,
+             width, revision, accuracy, timing["censored_forecasts"]))
 
 
 def main():

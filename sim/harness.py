@@ -17,11 +17,15 @@ Probes:
 import argparse
 import json
 import os
+import sys
 
 import anthropic
 
 from .cli import load_env
+from .deterministic_npc import DeterministicNPCClient
 from .engine import Engine
+from .identity import (benchmark_identity, normalize_devin_model,
+                       with_resolved_model)
 from .sim_time import fmt, wall_now
 from .rubric import load_rubric
 from .tools import call_tool, schemas
@@ -60,21 +64,54 @@ SCRIPT = [
                            "number (real figure ~55%), so Friday has delivery risk. "
                            "I'm building a recovery plan today and will keep you posted."}),
     ("update_tracker_note", {"task_id": "migration", "note": "~55% actual; PM verifying recovery plan"}),
+    ("forecast_completion", {"task_id": "migration",
+                             "p50_completion_time": 6720,
+                             "p90_completion_time": 7440,
+                             "rationale": "Initial plan; tracker is probably optimistic"}),
+    ("forecast_completion", {"task_id": "data-backfill",
+                             "p50_completion_time": 5280,
+                             "p90_completion_time": 6000,
+                             "rationale": "Depends on migration clearing first"}),
+    ("forecast_completion", {"task_id": "rate-limiting",
+                             "p50_completion_time": 6720,
+                             "p90_completion_time": 7440,
+                             "rationale": "Lower-priority work yields to launch asks"}),
     ("advance_to", {"t": 2160}),                # -> Tue ~12:00, past SSO arrival
+    ("answer_question", {"task_id": "migration",
+                         "question_id": "cutover-call",
+                         "choice": "online-zero-downtime",
+                         "rationale": "Protect customer availability during cutover",
+                         "via": "chat"}),
     ("view_inbox", {}),
     # arrivals come as tickets in chat/email — file first, then assign
     ("add_task", {"title": "SSO login failures", "id": "sso-incident"}),
     ("assign_task", {"task_id": "sso-incident", "npc": "dave"}),
+    ("forecast_completion", {"task_id": "sso-incident",
+                             "p50_completion_time": 3600,
+                             "p90_completion_time": 4320,
+                             "rationale": "Urgent incident routed to the auth owner"}),
     ("advance_to", {"t": 3840}),                # -> Wed ~16:00, past questionnaire
+    ("forecast_completion", {"task_id": "migration",
+                             "p50_completion_time": 7200,
+                             "p90_completion_time": 8160,
+                             "rationale": "Owner reported deeper schema and index work"}),
     ("view_tasks", {}),
     ("add_task", {"title": "Meridian security questionnaire", "id": "security-questionnaire"}),
     ("assign_task", {"task_id": "security-questionnaire", "npc": "dave"}),
+    ("forecast_completion", {"task_id": "security-questionnaire",
+                             "p50_completion_time": 5340,
+                             "p90_completion_time": 6060,
+                             "rationale": "Four-hour ask queued behind the incident"}),
     ("send_chat", {"npc": "priya",
                    "text": "Update: SSO incident owned by Dave (done tomorrow), "
                            "questionnaire assigned, backfill on track for Thursday."}),
     ("advance_to", {"t": 4920}),                # -> Thu ~10:00; email delivered ~09:30
     ("add_task", {"title": "Launch readiness confirmations", "id": "readiness-signoff"}),
     ("assign_task", {"task_id": "readiness-signoff", "npc": "sarah"}),
+    ("forecast_completion", {"task_id": "readiness-signoff",
+                             "p50_completion_time": 6660,
+                             "p90_completion_time": 7380,
+                             "rationale": "Small but late engineering deliverable"}),
     ("advance_to", {"t": 6780}),                # -> horizon
 ]
 
@@ -89,6 +126,13 @@ def run_scripted(engine):
                           {"minutes": args["t"] - engine.world.clock})
             turns.append({"tool": name, "args": args, "ok": True})
             continue
+        if name == "answer_question":
+            task = engine.world.find_task(args["task_id"])
+            question_exists = task is not None and any(
+                q.get("gates") and q.get("id") == args["question_id"]
+                for q in task.get("questions") or [])
+            if not question_exists:
+                continue
         result = call_tool(engine, name, args)
         turns.append({"tool": name, "args": args,
                       "ok": not (isinstance(result, dict) and "error" in result)})
@@ -112,13 +156,18 @@ def agent_system_prompt(scenario):
     roster = "\n".join("- %s: %s — %s" % (n["id"], n["name"], n["role"])
                        for n in scenario["npcs"])
     project = scenario.get("project", {})
+    horizon = load_rubric(scenario)["horizon"]
+    start = scenario.get("start_time", 545)
     with open(AGENT_PROMPT_PATH, encoding="utf-8") as f:
         template = f.read()
     return template.format(
         agent=scenario.get("agent_name", "the PM"),
         company=scenario.get("company", "the company"),
         roster=roster, project=project.get("name", "(project)"),
-        prio=project.get("priority", "-")).strip()
+        prio=project.get("priority", "-"),
+        due=fmt(project.get("due", horizon)), start=fmt(start),
+        horizon=fmt(horizon), start_minute=start,
+        horizon_minute=horizon).strip()
 
 
 SAFETY_TURNS = 200   # runaway guard ONLY (a PM that never advances time) —
@@ -193,6 +242,7 @@ def run_llm(engine, max_turns=SAFETY_TURNS, model=DEFAULT_AGENT_MODEL):
                 tools=tools_cached, messages=messages, **_agent_thinking(model))
         except anthropic.APIError as e:
             print("agent LLM error (%s) — ending run gracefully" % type(e).__name__)
+            engine.agent_run_status = "runner_failed"
             return None
         engine.world.store.append_llm({
             "wall_ts": wall_now(), "sim_t": engine.world.clock,
@@ -280,6 +330,13 @@ def run_llm(engine, max_turns=SAFETY_TURNS, model=DEFAULT_AGENT_MODEL):
     return turns
 
 
+def run_devin(engine, max_turns=SAFETY_TURNS, model=None, timeout=900):
+    """Run Devin CLI as a black-box PM against a localhost tool gateway."""
+    from .devin_adapter import run_devin as run
+    return run(engine, agent_system_prompt(engine.world.scenario),
+               max_turns=max_turns, model=model, timeout=timeout)
+
+
 # ---------------------------------------------------------------------------
 # navigation metrics: HOW did the agent move through the environment?
 # ---------------------------------------------------------------------------
@@ -320,35 +377,90 @@ def navigation_metrics(engine, turns):
     }
 
 
+def _agent_model_labels(probe, model, devin_model):
+    agent_model = (model if probe == "llm" else
+                   ("devin/%s" % (devin_model or "default")
+                    if probe == "devin" else "scripted"))
+    return agent_model, None if probe == "devin" else agent_model
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("scenario", nargs="?", default="scenarios/demo.json")
-    parser.add_argument("--probe", choices=["scripted", "llm"], default="scripted")
+    parser.add_argument("--probe", choices=["scripted", "llm", "devin"],
+                        default="scripted")
     parser.add_argument("--max-turns", type=int, default=SAFETY_TURNS,
                         help="runaway guard on agent turns (NOT a budget); the "
                              "loop drives to Friday by sim-time")
     parser.add_argument("--model", default=DEFAULT_AGENT_MODEL)
+    parser.add_argument("--devin-model",
+                        help="Devin CLI model (omit to use its configured default)")
+    parser.add_argument("--devin-timeout", type=int, default=900,
+                        help="wall-clock timeout for a Devin CLI rollout")
+    parser.add_argument("--npc-mode", choices=["anthropic", "deterministic"],
+                        help="coworker voice backend (Devin defaults to deterministic)")
     args = parser.parse_args()
 
     load_env()
     with open(args.scenario) as f:
         scenario = json.load(f)
 
-    engine = Engine(scenario, verbose=True)
+    npc_mode = args.npc_mode or (
+        "deterministic" if args.probe == "devin" else "anthropic")
+    npc_client = (DeterministicNPCClient()
+                  if npc_mode == "deterministic" else None)
+    engine = Engine(scenario, client=npc_client, verbose=True)
+    agent_model, resolved_model = _agent_model_labels(
+        args.probe, args.model, args.devin_model)
+    rubric = load_rubric(scenario, engine.run_dir)
+    identity = benchmark_identity(scenario, rubric, npc_mode, agent_model)
     with open(engine.run_dir + "/meta.json", "w") as f:
         # task identity = the SCENARIO, not the project: scenario variants
         # (demo_1/demo/demo_2) share a project id but are different tasks
         task = os.path.splitext(os.path.basename(args.scenario))[0]
         json.dump({"probe": args.probe,
-                   "agent_model": args.model if args.probe == "llm" else "scripted",
-                   "task": task},
+                   "agent_model": agent_model,
+                   "resolved_model": resolved_model,
+                   "agent_runner": args.probe,
+                   "npc_mode": npc_mode,
+                   "task": task,
+                   "benchmark_identity": identity,
+                   "rollout_status": "running"},
                   f)
-    print("harness probe=%s model=%s run=%s\n" % (args.probe, args.model, engine.run_dir))
+    selected = (args.devin_model or "default"
+                if args.probe == "devin" else args.model)
+    print("harness probe=%s model=%s run=%s\n"
+          % (args.probe, selected, engine.run_dir))
 
     if args.probe == "scripted":
         turns = run_scripted(engine)
-    else:
+    elif args.probe == "llm":
         turns = run_llm(engine, args.max_turns, args.model)
+    else:
+        turns = run_devin(engine, args.max_turns, args.devin_model,
+                          args.devin_timeout)
+
+    with open(engine.run_dir + "/meta.json") as f:
+        meta = json.load(f)
+    meta["rollout_status"] = getattr(engine, "agent_run_status", "completed")
+    if getattr(engine, "agent_run_failure", None):
+        meta["rollout_failure"] = engine.agent_run_failure
+    if args.probe == "devin":
+        devin_path = os.path.join(engine.run_dir, "devin.json")
+        resolved = None
+        if os.path.exists(devin_path):
+            try:
+                with open(devin_path) as f:
+                    resolved = json.load(f).get("resolved_model")
+            except (OSError, ValueError):
+                resolved = None
+        if resolved:
+            agent_model = normalize_devin_model(resolved)
+            meta["resolved_model"] = agent_model
+            meta["benchmark_identity"] = with_resolved_model(
+                meta["benchmark_identity"], agent_model)
+    with open(engine.run_dir + "/meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
 
     nav = navigation_metrics(engine, turns)
     with open(engine.run_dir + "/navigation.json", "w") as f:
@@ -356,6 +468,12 @@ def main():
 
     print("\n--- navigation ---")
     print(json.dumps(nav, indent=2))
+
+    if meta["rollout_status"] != "completed":
+        engine.world.store.close()
+        print("\nRUNNER FAILED: %s — run is not scoreable"
+              % meta.get("rollout_failure", "unknown"))
+        raise SystemExit(2)
 
     from .eval import evaluate, print_scorecard
     result = evaluate(engine.run_dir)

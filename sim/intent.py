@@ -52,15 +52,16 @@ def _knowable_at(arr, scenario):
     return arr["at"] + 1
 
 
-def _gating_questions(scenario):
-    """(open_time, holder) for every blocking question — the oracle must ANSWER
-    these to unblock the critical path, so they belong in the policy timeline."""
+def _gating_questions(scenario, choices=None):
+    """(at, task_id, question_id, choice) for every blocking question."""
+    choices = choices or {}
     out = []
     for t in scenario["project"]["tasks"]:
-        holder = (t.get("assignees") or [None])[0]
         for q in t.get("questions") or []:
             if q.get("gates"):
-                out.append((q["at"], q.get("held_by") or holder))
+                choice = choices.get(q["id"],
+                                     (q.get("options") or ["proceed"])[0])
+                out.append((q["at"], t["id"], q["id"], choice))
     return out
 
 
@@ -110,19 +111,21 @@ def _run_policy(scenario, name, opt, timing, noisy=False, answer_qs=True):
         if who and who != default:   # same-owner reassign is pure loss
             plan.append((when, "assign", arr["task"]["id"], who))
     if answer_qs:
-        for at, holder in _gating_questions(scenario):
+        for at, task_id, question_id, choice in _gating_questions(
+                scenario, opt.get("choices") or {}):
             when = at + 1 if timing != "late" else min(at + 1440, horizon_guess - 120)
-            plan.append((when, "answer", holder, None))
-    for when, kind, a, b in sorted(plan, key=lambda x: (x[0], x[1])):
+            plan.append((when, "answer", task_id, question_id, choice))
+    for when, kind, a, b, *rest in sorted(plan, key=lambda x: (x[0], x[1])):
         goto(when)
         if kind == "assign":
             call_tool(eng, "assign_task", {"task_id": a, "npc": b})
             if noisy:
                 ping(b)
-        else:  # answer the blocker via a quick chat to its holder
-            call_tool(eng, "send_chat",
-                      {"npc": a, "text": "decision made — go with option A; "
-                                         "you're unblocked."})
+        else:
+            call_tool(eng, "answer_question",
+                      {"task_id": a, "question_id": b, "choice": rest[0],
+                       "rationale": "Fastest safe path for the committed outcome",
+                       "via": "chat"})
 
     goto(load_horizon(scenario))
     return evaluate(run_dir)

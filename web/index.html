@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>project_manager_sim — observer</title>
+<title>PM-Bench — observer</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   .viz-root {
@@ -473,7 +473,9 @@ function loadRun(id) {
 function renderChips() {
   $("runs-row").innerHTML = RUNS.map(r => {
     const short = r.id.replace("run-", "");
-    const sc = r.score != null ? `<span class="sc">${r.score.toFixed(2)}</span>` : "";
+    const sc = r.rollout_status === "runner_failed"
+      ? `<span class="sc">failed</span>`
+      : (r.score != null ? `<span class="sc">${r.score.toFixed(2)}</span>` : "");
     const tk = r.task ? `<span class="tk" title="${esc(r.task)}">${esc(r.task)}</span> · ` : "";
     return `<div class="chip-run ${r.id === currentRun ? "sel" : ""}"
       onclick="selectRun('${r.id}')" title="${esc(r.task || "")} — ${r.events} events">
@@ -490,6 +492,8 @@ function modelColor(label) {
   if (label.includes("haiku")) return "var(--c-n2)";
   if (label.includes("fable")) return "var(--c-n4)";
   if (label.includes("gpt") || label.startsWith("o")) return "var(--c-n5)";
+  if (label.includes("kimi")) return "var(--c-n2)";
+  if (label.includes("swe")) return "var(--c-n4)";
   if (label.includes("scripted")) return "var(--c-n3)";
   return "var(--ink-3)";
 }

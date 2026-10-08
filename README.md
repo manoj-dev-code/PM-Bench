@@ -1,4 +1,4 @@
-# project_manager_sim
+# PM-Bench
 
 A discrete-event simulation of a project manager's week at a small SaaS
 company (see `Problem.txt`) — built as an evaluation and RL-training
@@ -58,12 +58,34 @@ cp .env.example .env   # fill in ANTHROPIC_API_KEY
 .venv/bin/python -m sim.harness scenarios/demo.json --probe scripted     # zero agent tokens
 .venv/bin/python -m sim.harness scenarios/demo_2.json --probe llm --model claude-sonnet-5
 
+# use Devin CLI as the PM (one-time prerequisite: devin auth login)
+.venv/bin/python -m sim.harness scenarios/crunch.json --probe devin
+.venv/bin/python -m sim.harness scenarios/crunch.json --probe devin --devin-model opus
+
+# compare model families on identical tasks (defaults: swe, gpt, opus, kimi)
+.venv/bin/python -m sim.devin_matrix scenarios/crunch.json --models swe gpt opus kimi
+.venv/bin/python -m sim.devin_matrix scenarios/crunch.json --models swe gpt opus kimi -k 3
+
+# inspect exact commands first; use exact IDs from `devin models list --format json`
+# instead of moving family aliases when you need a permanently reproducible panel
+.venv/bin/python -m sim.devin_matrix scenarios/crunch.json \
+  --models swe gpt opus kimi --dry-run
+
 # grade a run (deterministic, reproducible forever)
 .venv/bin/python -m sim.eval runs/run-XXXXXXXX-XXXXXX
 
 # replay any run with zero LLM calls
 .venv/bin/python -m sim.replay runs/run-XXXXXXXX-XXXXXX [until_seq]
 ```
+
+Devin matrix runs use `--npc-mode deterministic` by default: coworker messages
+are rendered from authored scenario intents and belief events without a second
+model provider. This removes the `ANTHROPIC_API_KEY` requirement. For the same
+scenario state and action history, deterministic mode produces the same
+authored facts, timing, and wording; different model actions may intentionally
+produce different trajectories. Use
+`--npc-mode anthropic` only when intentionally testing stochastic, persona-rich
+NPC dialogue with an Anthropic key configured.
 
 ## Tests
 
@@ -122,10 +144,62 @@ Every number is deterministic and re-computable forever from the run dir
 (`python -m sim.eval runs/<id>`); scorecards carry a `scored_with` hash of
 the scoring source so stale caches self-identify.
 
+The benchmark also measures **prospective calibrated time sense** separately
+from reward. Agents record an initial `p50/p90` completion interval (absolute
+simulated minutes, `p50 <= p90`) for each visible authored task before it
+completes, then may revise only after new evidence or a plan mutation. Each
+accepted forecast costs one simulated minute. Reports include p50 initial,
+final, and work-time-weighted MAE, p90 coverage and final error, mean interval
+width (including censored tasks), pinball loss for both quantiles, revision
+improvement, belief-reveal coverage and latency, by-horizon accuracy, and
+censored unfinished tasks. Calibration is never shown without coverage and
+censoring, so an agent cannot look accurate merely by forecasting one easy
+item.
+
+`python -m sim.bench runs` reports Max@k inside a canonical benchmark
+coordinate: `(semantic scenario, physics source, evidence renderer + NPC mode,
+pinned rubric, resolved model)`. The first four plus NPC mode form
+`task_version`; `task_version + resolved model` forms `coordinate`.
+Incompatible task or environment versions never share a cell. Model aliases
+such as `devin/swe` are launch labels only — the exported resolved model ID is
+the comparison identity. It does not pool different tasks and call their
+maximum Max@k; the cross-task summary is an equal-task macro-average of
+task-level means. Failed runners and runs that never reached their evaluation
+horizon are excluded and reported.
+
+The Devin adapter runs the CLI in a temporary workspace with benchmark source
+and scenario truth absent. Its only approved command calls the same canonical
+tool registry used by the Claude harness and UI. The simulator remains the
+clock owner: Devin inference latency is wall-clock telemetry only.
+
+Blocking decisions are explicit state transitions: agents must call
+`answer_question` with the authored task, question, option, rationale, and
+delivery channel. Ordinary chat or email can discuss a blocker but cannot
+silently unblock it. Options can carry deterministic consequences — effort
+deltas and named capacity costs — activated only at the decision's delivery
+instant, so an email choice does not change work before it lands. Meeting
+throughput counts eligible workers only; the PM and stakeholder attendees
+consume calendar time but never manufacture labor.
+
+Authored work may also be staged: a work item expands deterministically into
+sequential scheduler tasks, and a quality gate may pre-materialize a hidden
+rework stage. The rework exists in ground truth but stays off the tracker
+until its gate truly completes, at which point a `task_revealed` event wakes
+the PM and tells the owner the authored reason. Each stage carries a
+`score_weight_factor`, so splitting work changes sequencing and visibility
+without changing the item's total priority weight.
+
+`scenarios/crunch.json`, the recommended comparison task, now includes two
+successive belief corrections on the critical migration, an explicit cutover
+tradeoff, a migration review gate before backfill, handoff/helper onboarding
+capacity costs, a cancellable standing meeting, an authored OOO block, and
+forecast revision measurement. This makes the model update its plan and time
+estimate as evidence changes rather than react to a single scripted reveal.
+
 | attack | defense |
 |---|---|
 | look busy (chats, meetings, check-ins) | activity earns nothing; interruptions cost the recipient 20 serialized focus-min and meetings block calendars — measured runs of chatty PMs score **below zero** |
-| mint value with made-up tasks | agent-created tasks carry zero rubric weight (but still consume real capacity if staffed) |
+| mint value with made-up tasks | agent-created items are tracking-only: zero rubric weight and zero scheduler capacity |
 | relabel a task's priority to score more | `reprioritize` changes scheduling order only; scoring weight stays authored |
 | claim credit for work that happens anyway | the baseline is a complete unmanaged org (default owners work every arrival); score 0 = "added nothing beyond it" |
 | out-labor the ceiling via stakeholders | the labor pool binds both sides: OPT excludes `worker:false` people and the engine refuses to assign them |

@@ -214,7 +214,8 @@ def swarm_rate(t, attendees, skills, physics=None):
 
 
 def compute_schedule(tasks, sim_start, busy_by_assignee=None, skills=None,
-                     deposits=None, answers=None, physics=None):
+                     deposits=None, answers=None, physics=None,
+                     decision_effects=None):
     """Fully PREEMPTIVE, event-sourced scheduler. At every instant each person
     works their highest-priority READY task; the moment that changes — a
     higher-priority task arrives or unblocks, or the PM reprioritizes at a
@@ -255,8 +256,13 @@ def compute_schedule(tasks, sim_start, busy_by_assignee=None, skills=None,
     # its open-time until answered_at (never, if absent). Derived upstream from
     # the message log (real run) / instant (OPT) / empty (no-PM baseline).
     answers = answers or {}
+    decision_effects = decision_effects or {}
+    effects = {tid: sorted(decision_effects.get(tid, []),
+                          key=lambda e: (e["at"], e.get("question_id", "")))
+               for tid in sched}
     segments = {tid: [] for tid in sched}
     done_at, started, applied = {}, {}, set()
+    applied_effects = set()
     for tid in sched:
         if remaining[tid] <= 0:
             done_at[tid] = _earliest(sched[tid], sim_start)
@@ -268,6 +274,8 @@ def compute_schedule(tasks, sim_start, busy_by_assignee=None, skills=None,
             statics.add(ev.get("at", sim_start))
         for (end, _dep) in deposits.get(tid, []):
             statics.add(end)   # a meeting's output lands at its end
+        for ev in effects.get(tid, []):
+            statics.add(ev["at"])
         for q in t.get("questions") or []:
             if q.get("gates"):
                 statics.add(q["at"])                     # block opens
@@ -298,6 +306,21 @@ def compute_schedule(tasks, sim_start, busy_by_assignee=None, skills=None,
                         remaining[tid] = 0
                         done_at.setdefault(tid, end)
 
+    def apply_effects(clock):
+        # A choice effect is pinned into the question_answered event and becomes
+        # active at its delivery instant — never when the PM merely sent it.
+        for tid in sched:
+            for i, ev in enumerate(effects.get(tid, [])):
+                if ev["at"] > clock or (tid, i) in applied_effects:
+                    continue
+                applied_effects.add((tid, i))
+                if remaining[tid] <= 0:
+                    continue
+                remaining[tid] += ev.get("task_effort_delta_hours", 0) * 60.0
+                if remaining[tid] <= 1e-6:
+                    remaining[tid] = 0
+                    done_at.setdefault(tid, ev["at"])
+
     def ready(tid, clock):
         t = sched[tid]
         if remaining[tid] <= 0 or _earliest(t, sim_start) > clock:
@@ -316,6 +339,7 @@ def compute_schedule(tasks, sim_start, busy_by_assignee=None, skills=None,
         return True
 
     clock, INF, guard = sim_start, float("inf"), 0
+    apply_effects(clock)
     apply_deposits(clock)
     while any(r > 0 for r in remaining.values()) and guard < 100000:
         guard += 1
@@ -359,6 +383,7 @@ def compute_schedule(tasks, sim_start, busy_by_assignee=None, skills=None,
                 remaining[tid] = 0
                 done_at.setdefault(tid, comp.get(tid, nxt))
         clock = nxt
+        apply_effects(clock)    # delivered choices landing at `nxt`
         apply_deposits(clock)   # meeting outputs landing at `nxt`
 
     return {tid: {"start": started.get(tid), "done_at": done_at.get(tid),
@@ -381,22 +406,30 @@ def _accrued_hours(seg_row, sim_start_seed, now, task_deposits=()):
 
 
 def task_view(tasks, sim_start, now, busy_by_assignee=None, skills=None,
-              deposits=None, answers=None, physics=None):
+              deposits=None, answers=None, physics=None,
+              decision_effects=None):
     """Ground-truth task states at `now`. Tasks not yet arrived are omitted."""
     busy_by_assignee = busy_by_assignee or {}
     deposits = deposits or {}
     answers = answers or {}
+    decision_effects = decision_effects or {}
     sched = compute_schedule(tasks, sim_start, busy_by_assignee, skills,
-                             deposits, answers, physics)
+                             deposits, answers, physics, decision_effects)
     out = []
     for t in tasks:
         if t.get("arrival", sim_start) > now:
             continue  # doesn't exist yet at this (possibly rewound) time
+        effective_effort = t.get("effort_hours")
+        if effective_effort is not None:
+            effective_effort += sum(
+                ev.get("task_effort_delta_hours", 0)
+                for ev in decision_effects.get(t["id"], [])
+                if ev["at"] <= now)
         row = {
             "id": t["id"],
             "title": t["title"],
             "assignees": t.get("assignees", []),
-            "effort_hours": t.get("effort_hours"),
+            "effort_hours": effective_effort,
             "blocked_by": t.get("blocked_by", []),
             "reported": t.get("reported", ""),
             "source": t.get("source", "seed"),
@@ -405,6 +438,10 @@ def task_view(tasks, sim_start, now, busy_by_assignee=None, skills=None,
             # progress that predates the week — utilization must not credit it
             "seed_done_hours": t.get("done_hours", 0),
         }
+        for key in ("score_weight_factor", "work_item_id", "work_item_title",
+                    "stage_id", "stage_kind", "contingent"):
+            if key in t:
+                row[key] = t[key]
         if not _schedulable(t):
             row.update(status="tracking", pct=None, true_done_hours=None,
                        projected_done=None)
@@ -413,9 +450,10 @@ def task_view(tasks, sim_start, now, busy_by_assignee=None, skills=None,
                        true_done_hours=t.get("done_hours", 0), projected_done=None)
         else:
             s = sched[t["id"]]
-            effort, base = t["effort_hours"], t.get("done_hours", 0)
+            effort, base = effective_effort, t.get("done_hours", 0)
             done_at = s["done_at"]
             true_done = _accrued_hours(s, base, now, deposits.get(t["id"], ()))
+            true_done = min(true_done, effort)
             if done_at is not None and now >= done_at:
                 status, true_done = "done", effort
             else:
@@ -445,8 +483,10 @@ def task_view(tasks, sim_start, now, busy_by_assignee=None, skills=None,
 
 
 def task_done(tasks, sim_start, now, task_id, busy_by_assignee=None, skills=None,
-              deposits=None, answers=None, physics=None):
+              deposits=None, answers=None, physics=None,
+              decision_effects=None):
     sched = compute_schedule(tasks, sim_start, busy_by_assignee or {}, skills,
-                             deposits or {}, answers or {}, physics)
+                             deposits or {}, answers or {}, physics,
+                             decision_effects)
     s = sched.get(task_id)
     return s is not None and s["done_at"] is not None and now >= s["done_at"]

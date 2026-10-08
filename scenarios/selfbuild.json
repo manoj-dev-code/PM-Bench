@@ -49,6 +49,10 @@
             "at": 1980,
             "gates": true,
             "held_by": "maya",
+            "options": [
+              "event-log-with-captured-text",
+              "rerun-npc-llm-on-replay"
+            ],
             "ping": "I need your call on the determinism boundary before I can finish replay: do we re-run the NPC LLM calls on replay (simpler, but non-deterministic) or fold state purely from the event log with captured text (deterministic, more plumbing)? It changes the core loop and I'm blocked on the engine until you decide. One-line answer, but I can't move till I hear back."
           }
         ],
@@ -236,7 +240,7 @@
     }
   ],
   "band": {
-    "scored_with": "5ab427cc8e20",
+    "scored_with": "2458a86e1d93",
     "no_pm_baseline": {
       "combined": 21.082,
       "completion": 24.659,

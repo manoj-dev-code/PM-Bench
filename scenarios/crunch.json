@@ -5,6 +5,8 @@
   "start_time": 545,
   "costs": {
     "chat_interrupt_minutes": 10,
+    "handoff_minutes": 45,
+    "helper_onboarding_minutes": 30,
     "_note": "Refocus tax: work-hours the recipient loses per CHAT the PM sends (serialized; email is exempt). The knob for how much interrupting people costs — raise it to punish chatty PMs harder, set 0 to make communication free (ablation)."
   },
   "answer_batch_minutes": 120,
@@ -49,6 +51,27 @@
             "at": 1980,
             "gates": true,
             "held_by": "sarah",
+            "options": [
+              "online-zero-downtime",
+              "maintenance-window"
+            ],
+            "choice_effects": {
+              "online-zero-downtime": {
+                "summary": "Avoids customer downtime but dual-write verification adds about 4 hours of migration work.",
+                "task_effort_delta_hours": 4
+              },
+              "maintenance-window": {
+                "summary": "Removes about 6 hours from the migration, but Dave must spend 4 hours on approval, runbook, and customer communication.",
+                "task_effort_delta_hours": -6,
+                "capacity_costs": [
+                  {
+                    "npc": "dave",
+                    "minutes": 240,
+                    "reason": "maintenance approval, runbook, and customer communication"
+                  }
+                ]
+              }
+            },
             "ping": "Before I go further on the migration I need your call on the cutover approach — online (zero-downtime, slower) or a maintenance window (faster but needs sign-off). I can't safely run the core step until you decide. One-line answer, but I'm stuck on it till I hear back."
           }
         ],
@@ -62,10 +85,67 @@
             "pct": 55,
             "note": "schema rework surfaced — actually ~55%, roughly 35 focused hours of real DB work left; Friday is at serious risk",
             "proactive_ping": true
+          },
+          {
+            "at": 3840,
+            "pct": 48,
+            "note": "the cutover rehearsal exposed slower index rebuilds than expected; the recovery plan helped, but Friday still has very little margin",
+            "proactive_ping": true
           }
         ],
         "tags": [
           "db"
+        ]
+      },
+      {
+        "id": "migration-review",
+        "title": "Migration review and rollback verification",
+        "blocked_by": [
+          "migration"
+        ],
+        "priority": "P0",
+        "tags": [
+          "db",
+          "ops"
+        ],
+        "stages": [
+          {
+            "id": "review",
+            "title": "Code and cutover review",
+            "kind": "review",
+            "assignees": [
+              "dave"
+            ],
+            "effort_hours": 2,
+            "done_hours": 0,
+            "reported": "Waiting for implementation",
+            "quality_gate": {
+              "outcome": "rework",
+              "reason": "Rollback automation missed a lock-timeout recovery path.",
+              "rework": {
+                "id": "rollback-rework",
+                "title": "Fix rollback automation findings",
+                "kind": "rework",
+                "assignees": [
+                  "sarah"
+                ],
+                "effort_hours": 3,
+                "done_hours": 0,
+                "reported": "Review findings need correction"
+              }
+            }
+          },
+          {
+            "id": "rollback-verification",
+            "title": "Rollback verification",
+            "kind": "verification",
+            "assignees": [
+              "dave"
+            ],
+            "effort_hours": 2,
+            "done_hours": 0,
+            "reported": "Waiting for review"
+          }
         ]
       },
       {
@@ -77,7 +157,7 @@
         "effort_hours": 12,
         "done_hours": 0,
         "blocked_by": [
-          "migration"
+          "migration-review"
         ],
         "reported": "Not started",
         "priority": "P0",
@@ -101,6 +181,19 @@
       }
     ]
   },
+  "meetings": [
+    {
+      "id": "architecture-sync",
+      "start": 2010,
+      "end": 2040,
+      "attendees": [
+        "sarah",
+        "dave"
+      ],
+      "topic": "Standing architecture sync",
+      "agenda": "Routine design review; cancel if the migration recovery needs the time"
+    }
+  ],
   "task_arrivals": [
     {
       "at": 2130,
@@ -201,7 +294,13 @@
       "skills": {
         "auth": 1.3,
         "ops": 1.2
-      }
+      },
+      "ooo": [
+        [
+          5100,
+          5340
+        ]
+      ]
     },
     {
       "id": "priya",
@@ -234,21 +333,22 @@
     }
   ],
   "band": {
+    "scored_with": "2458a86e1d93",
     "no_pm_baseline": {
       "combined": 21.082,
       "completion": 24.659,
       "efficiency": 13.929,
-      "done_weight_rate": 0.579
+      "done_weight_rate": 0.478
     },
     "opt_max": {
-      "combined": 28.363,
-      "completion": 34.667,
-      "efficiency": 15.757,
-      "done_weight_rate": 0.789
+      "combined": 33.542,
+      "completion": 41.778,
+      "efficiency": 17.069,
+      "done_weight_rate": 0.826
     },
-    "winnable_combined": 7.281,
-    "log10_trajectory_classes": 12.2,
-    "capacity_utilization": 0.95,
+    "winnable_combined": 12.46,
+    "log10_trajectory_classes": 13.1,
+    "capacity_utilization": 1.04,
     "forced_triage": true,
     "min_reaction_ratio": 1.07,
     "_": "derived by `python -m sim.difficulty --stamp` — re-stamp after edits"

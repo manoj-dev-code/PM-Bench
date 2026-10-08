@@ -66,7 +66,8 @@ def task_value(task_rows, cfg, horizon, sim_start, workers=None,
             continue  # zero weight: agents can't mint value
         if not t.get("effort_hours"):
             continue  # tracking-only items carry no schedulable value
-        w = weights.get(t.get("priority") or "P2", 2)
+        w = (weights.get(t.get("priority") or "P2", 2)
+             * t.get("score_weight_factor", 1.0))
         progress = min(1.0, (t.get("true_done_hours") or 0.0) / t["effort_hours"])
         done = t["status"] == "done"
         completion = w * (progress + alpha * (1.0 if done else 0.0)) / (1 + alpha)

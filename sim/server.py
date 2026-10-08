@@ -24,6 +24,8 @@ from urllib.parse import parse_qs, urlparse
 
 from .cli import load_env
 from .engine import Engine
+from .identity import (legacy_run_identity, resolved_model_id,
+                       with_resolved_model)
 from .sim_time import fmt
 from .tools import call_tool, schemas
 
@@ -161,6 +163,44 @@ def generate_analysis(run_dir, refresh=False):
     return out
 
 
+def problem_graph(scenario):
+    """Researcher-only materialized problem graph used by /api/problem."""
+    from .optimal import _all_tasks, worker_ids
+    from .sim_time import working_minutes_between
+    start = scenario.get("start_time", 545)
+    via = {a["task"]["id"]: a.get("via", "chat")
+           for a in scenario.get("task_arrivals", [])}
+    tasks = []
+    for t in _all_tasks(scenario):
+        row = {"id": t["id"], "title": t["title"],
+               "priority": t.get("priority"),
+               "effort_hours": t.get("effort_hours"),
+               "done_hours": t.get("done_hours", 0),
+               "blocked_by": t.get("blocked_by", []),
+               "owner": (t.get("assignees") or [None])[0],
+               "urgent": bool(t.get("urgent")),
+               "arrival": t.get("arrival", start),
+               "source": t.get("source", "seed")}
+        for key in ("work_item_id", "work_item_title", "stage_id",
+                    "stage_kind", "contingent", "score_weight_factor"):
+            if key in t:
+                row[key] = t[key]
+        if row["source"] == "external":
+            row["via"] = via.get(t["id"], "chat")
+        tasks.append(row)
+    due = (scenario.get("project") or {}).get("due")
+    workers = worker_ids(scenario)
+    people = [{"id": n["id"], "name": n["name"], "role": n["role"],
+               "worker": n["id"] in workers,
+               "skills": n.get("skills") or {}}
+              for n in scenario.get("npcs", [])]
+    return {"start": start, "due": due, "tasks": tasks,
+            "workers": len(workers), "people": people,
+            "capacity_hours": (round(len(workers) *
+                working_minutes_between(start, due) / 60.0, 1)
+                if due else None)}
+
+
 class RunHub:
     """One dashboard, every run: lists runs/ with labels (agent model, live
     status, score, cost) and serves any of them read-only via ?run=<id>."""
@@ -225,13 +265,16 @@ class RunHub:
             else:
                 label, score, completion, efficiency = "", None, None, None
                 probe, task, done_rate, fairness, band = "", "", None, None, None
+                rollout_status = "completed"
+                meta, scorecard = {}, {}
                 mp = os.path.join(d, "meta.json")
                 if os.path.exists(mp):
                     with open(mp) as f:
-                        m = json.load(f)
-                    label = m.get("agent_model") or m.get("probe", "")
-                    probe = m.get("probe", "")
-                    task = m.get("task", "")
+                        meta = json.load(f)
+                    label = meta.get("agent_model") or meta.get("probe", "")
+                    probe = meta.get("probe", "")
+                    task = meta.get("task", "")
+                    rollout_status = meta.get("rollout_status", "completed")
                 if not task:
                     # older runs: task id lives in the copied scenario
                     try:
@@ -245,10 +288,11 @@ class RunHub:
                 # run-end with the code of that run; `sim.bench` is the authoritative
                 # re-scorer that recomputes from events with current code. We flag
                 # staleness cheaply via `scored_with` rather than re-scoring here.
-                if os.path.exists(sp):
+                if rollout_status == "completed" and os.path.exists(sp):
                     try:
                         with open(sp) as f:
-                            sc = json.load(f)
+                            scorecard = json.load(f)
+                        sc = scorecard
                         score = sc.get("score")
                         if isinstance(sc.get("completion"), dict):
                             completion = sc["completion"].get("normalized")
@@ -266,14 +310,46 @@ class RunHub:
                     with open(ep) as f:
                         n = sum(1 for _ in f)
                 cost, tin, tout, turns = self._agent_cost(d)
+                if probe == "devin":
+                    dp = os.path.join(d, "devin.json")
+                    cp = os.path.join(d, "devin_conversation.json")
+                    if os.path.exists(dp):
+                        try:
+                            with open(dp) as f:
+                                turns = json.load(f).get("tool_calls", turns)
+                        except (OSError, ValueError):
+                            pass
+                    if os.path.exists(cp):
+                        try:
+                            with open(cp) as f:
+                                conversation = json.load(f)
+                            fm = conversation.get("final_metrics", {})
+                            tin = fm.get("total_prompt_tokens", tin)
+                            tout = fm.get("total_completion_tokens", tout)
+                        except (OSError, ValueError):
+                            pass
+                identity = meta.get("benchmark_identity") or legacy_run_identity(
+                    d, meta, scorecard)
+                resolved_model = resolved_model_id(d, meta)
+                if not resolved_model:
+                    resolved_model = (identity.get("model")
+                                      or meta.get("agent_model") or "unknown")
+                    if probe == "devin":
+                        resolved_model = "unresolved:" + resolved_model
+                identity = with_resolved_model(identity, resolved_model)
                 rec = {"id": rid, "label": label or "(interactive/other)",
                        "probe": probe, "task": task, "band": band,
+                       "task_version": identity["task_version"],
+                       "benchmark_coordinate": identity["coordinate"],
+                       "rollout_status": rollout_status,
+                       "resolved_model": resolved_model,
                        "events": n, "score": score, "completion": completion,
                        "efficiency": efficiency, "done_rate": done_rate,
                        "fairness": fairness, "cost_usd": cost,
                        "tokens_in": tin, "tokens_out": tout, "agent_turns": turns}
                 self._cache[rid] = (key, rec)
-            rec["live"] = (os.path.exists(ep)
+            rec["live"] = (rec["rollout_status"] == "running"
+                           and os.path.exists(ep)
                            and (_t.time() - os.path.getmtime(ep)) < 90
                            and rec["score"] is None)
             out.append(rec)
@@ -283,8 +359,12 @@ class RunHub:
         """Runs grouped by scenario/task: band, per-model aggregates (LLM
         probes with a score), and the raw run records (newest first)."""
         groups = {}
+        versions = {}
         for rec in self.list_runs():  # already newest-first
-            groups.setdefault(rec["task"] or "unknown", []).append(rec)
+            task = rec["task"] or "unknown"
+            version = rec.get("task_version") or "unknown"
+            groups.setdefault((task, version), []).append(rec)
+            versions.setdefault(task, set()).add(version)
 
         def std(recs, field):
             vals = [r[field] for r in recs if r[field] is not None]
@@ -298,11 +378,16 @@ class RunHub:
             return round(sum(vals) / len(vals), 3) if vals else None
 
         tasks = []
-        for name, recs in groups.items():
+        for (name, version), recs in groups.items():
+            display = (name if len(versions.get(name, ())) == 1
+                       else "%s@%s" % (name, version[:8]))
             by_label = {}
             for r in recs:
-                if r["probe"] == "llm" and r["score"] is not None:
-                    by_label.setdefault(r["label"], []).append(r)
+                if (r["probe"] in ("llm", "devin")
+                        and r["rollout_status"] == "completed"
+                        and r["score"] is not None):
+                    by_label.setdefault(
+                        r.get("resolved_model") or r["label"], []).append(r)
             models = {}
             for label, rs in by_label.items():
                 models[label] = {
@@ -321,7 +406,12 @@ class RunHub:
                     "runs": [r["id"] for r in rs],
                 }
             bands = [r["band"] for r in recs if r["band"] is not None]
-            tasks.append({"task": name, "band": max(bands) if bands else None,
+            tasks.append({"task": display, "task_name": name,
+                          "task_version": version,
+                          "benchmark_coordinates": sorted({
+                              r.get("benchmark_coordinate") for r in recs
+                              if r.get("benchmark_coordinate")}),
+                          "band": max(bands) if bands else None,
                           "models": models, "runs": recs})
         tasks.sort(key=lambda t: (t["band"] is None,
                                   t["band"] if t["band"] is not None else 0))
@@ -448,43 +538,7 @@ class Handler(BaseHTTPRequestHandler):
                         else None)
             if scenario is None:
                 return self._json({"tasks": []})
-            start = scenario.get("start_time", 545)
-            out = []
-            for t in (scenario.get("project") or {}).get("tasks", []):
-                out.append({"id": t["id"], "title": t["title"],
-                            "priority": t.get("priority"),
-                            "effort_hours": t.get("effort_hours"),
-                            "done_hours": t.get("done_hours", 0),
-                            "blocked_by": t.get("blocked_by", []),
-                            "owner": (t.get("assignees") or [None])[0],
-                            "urgent": bool(t.get("urgent")),
-                            "arrival": start, "source": "seed"})
-            for arr in scenario.get("task_arrivals", []):
-                t = arr["task"]
-                out.append({"id": t["id"], "title": t["title"],
-                            "priority": t.get("priority"),
-                            "effort_hours": t.get("effort_hours"),
-                            "done_hours": 0,
-                            "blocked_by": t.get("blocked_by", []),
-                            "owner": (t.get("assignees") or [None])[0],
-                            "urgent": bool(t.get("urgent")),
-                            "arrival": arr["at"], "source": "external",
-                            "via": arr.get("via", "chat")})
-            from .optimal import worker_ids
-            from .sim_time import working_minutes_between
-            due = (scenario.get("project") or {}).get("due")
-            workers = worker_ids(scenario)
-            # the team, WITH hidden skill multipliers — ground truth for the
-            # researcher's problem view (the PM never sees these numbers)
-            people = [{"id": n["id"], "name": n["name"], "role": n["role"],
-                       "worker": n["id"] in workers,
-                       "skills": n.get("skills") or {}}
-                      for n in scenario.get("npcs", [])]
-            self._json({"start": start, "due": due, "tasks": out,
-                        "workers": len(workers), "people": people,
-                        "capacity_hours": (round(len(workers) *
-                            working_minutes_between(start, due) / 60.0, 1)
-                            if due else None)})
+            self._json(problem_graph(scenario))
         elif url.path == "/api/transcript":
             # the agent's whole conversation, OpenAI chat format, untruncated
             src = self._src(url.query)

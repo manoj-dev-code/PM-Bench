@@ -51,6 +51,10 @@
             "at": 1980,
             "gates": true,
             "held_by": "maya",
+            "options": [
+              "single-multi-tenant-schema",
+              "per-tenant-databases"
+            ],
             "ping": "Blocked on the data model before I can lock the API: single multi-tenant schema or per-tenant DBs? Billing + sync both hang off it — I'm idle until you call it."
           }
         ],
@@ -208,6 +212,10 @@
             "at": 1980,
             "gates": true,
             "held_by": "leo",
+            "options": [
+              "single-region-with-later-failover",
+              "multi-region-at-launch"
+            ],
             "ping": "Blocked on a launch-infra call only you/product can make: multi-region (safer,+a day) or single-region with failover later? Rollout forks here — idle until you pick."
           }
         ],
@@ -293,6 +301,10 @@
             "at": 2400,
             "gates": true,
             "held_by": "sara",
+            "options": [
+              "live-event-stream",
+              "nightly-batch-features"
+            ],
             "ping": "Blocked before I can train: use the live event stream or the nightly batch features? Recommendations + fraud both hang off this — parked until you decide."
           }
         ],
@@ -987,7 +999,7 @@
     }
   ],
   "band": {
-    "scored_with": "5ab427cc8e20",
+    "scored_with": "2458a86e1d93",
     "no_pm_baseline": {
       "combined": 101.618,
       "completion": 121.476,

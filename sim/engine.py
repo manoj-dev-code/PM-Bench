@@ -7,8 +7,11 @@ rebuild pending state on resume.
 
 import anthropic
 
+from copy import deepcopy
+
 from .events import EventQueue
 from .npc import NPC, generate_transcript
+from .rubric import load_rubric
 from .sim_time import fmt, in_working_hours
 from .store import RunStore, new_run_dir, setup_logging
 from .validate import bounds_of, check_task_bounds, validate_scenario
@@ -26,7 +29,9 @@ class Engine:
         self.run_dir = run_dir or new_run_dir()
         self.logger = setup_logging(self.run_dir).getChild("engine")
         self.world = World(scenario, store=RunStore(self.run_dir, scenario))
+        self.agent_horizon = load_rubric(scenario, self.run_dir)["horizon"]
         self.queue = EventQueue()
+        self._reveal_checks = set()
         self.client = client or anthropic.Anthropic()
         self.verbose = verbose
 
@@ -102,6 +107,11 @@ class Engine:
             elif e["kind"] == "task_completed":
                 new.append({"time": fmt(e["t"]),
                             "tracker": "task completed: %s" % e["task_id"]})
+            elif e["kind"] == "task_revealed":
+                new.append({"time": fmt(e["t"]),
+                            "work_revealed": e["title"],
+                            "task_id": e["task_id"],
+                            "reason": e["reason"]})
             elif e["kind"] == "room_line" and e["speaker"] != "agent":
                 m = next((x for x in self.world.meetings
                           if x["id"] == e["meeting_id"]), None)
@@ -167,6 +177,53 @@ class Engine:
                 if a in self.world.npcs:
                     self.world.npcs[a].notify(self.world.clock,
                                               "you finished '%s'" % row["title"])
+
+        rows = {r["id"]: r for r in self.world.tasks_view()}
+        for task in self.world.tasks:
+            if (not task.get("contingent")
+                    or task["id"] in self.world.revealed_tasks):
+                continue
+            blockers = task.get("hidden_until") or []
+            if not blockers:
+                continue
+            done_at = [rows.get(dep, {}).get("projected_done")
+                       for dep in blockers]
+            if any(t is None for t in done_at):
+                continue
+            when = max(done_at)
+            key = (task["id"], when)
+            if when > self.world.clock and key not in self._reveal_checks:
+                self._reveal_checks.add(key)
+                self._schedule(when, "work_reveal_check",
+                               {"task": task["id"]})
+        changed = True
+        while changed:
+            changed = False
+            for task in self.world.tasks:
+                if (not task.get("contingent")
+                        or task["id"] in self.world.revealed_tasks):
+                    continue
+                blockers = task.get("hidden_until") or []
+                if not blockers or not all(
+                        rows.get(dep, {}).get("status") == "done"
+                        for dep in blockers):
+                    continue
+                self.world.revealed_tasks.add(task["id"])
+                triggered = max(rows[dep]["projected_done"]
+                                for dep in blockers)
+                reason = task.get("quality_reason", "quality gate outcome")
+                self.world.record(
+                    "task_revealed", task_id=task["id"],
+                    work_item_id=task.get("work_item_id"),
+                    title=task["title"], reason=reason,
+                    triggered_at=triggered)
+                for owner in task.get("assignees", []):
+                    if owner in self.world.npcs:
+                        self.world.npcs[owner].notify(
+                            self.world.clock,
+                            "new work revealed on '%s': %s"
+                            % (task["title"], reason))
+                changed = True
 
     def _schedule_email_delivery(self, msg):
         """Email to the PM is a BATCHED PUSH: the agent has no background
@@ -258,9 +315,11 @@ class Engine:
     def agent_assign_task(self, task_id, npc_id):
         """Reassign work — a decision with real schedule consequences."""
         task = self.world.find_task(task_id)
-        if task is None or task.get("filed") is False:
+        if not self.world.task_visible(task) or task.get("filed") is False:
             # unfiled tickets aren't on the board: officially add first
             return {"error": "no task %r on the tracker" % task_id}
+        if len(task.get("assignees") or []) == 1 and task["assignees"][0] == npc_id:
+            return {"error": "%s already owns %r" % (npc_id, task_id)}
         if npc_id not in self.world.npcs:
             return {"error": "unknown person %r" % npc_id}
         spec = next(n for n in self.world.scenario["npcs"] if n["id"] == npc_id)
@@ -280,7 +339,18 @@ class Engine:
             changes["done_hours"] = row["true_done_hours"]
         prev = [a for a in (task.get("assignees") or [])
                 if a != npc_id and a in self.world.npcs]
+        old_owners = list(task.get("assignees") or [])
         task = self.world.update_task(task_id, changes, "agent")
+        handoff = int((self.world.scenario.get("costs") or {})
+                      .get("handoff_minutes", 0))
+        if handoff and old_owners != [npc_id]:
+            self.world.record("capacity_cost", person=npc_id,
+                              task_id=task_id, minutes=handoff,
+                              reason="handoff")
+            self.world.npcs[npc_id].notify(
+                self.world.clock,
+                "orientation on '%s' will cost about %d minutes"
+                % (task["title"], handoff))
         self.world.npcs[npc_id].notify(self.world.clock,
                                        "you've been assigned: '%s'" % task["title"])
         for a in prev:   # losing a task is an event in YOUR week too
@@ -291,7 +361,8 @@ class Engine:
                   % (self.world.now(), task_id, self.world.npcs[npc_id].name))
         # tracker-shaped acknowledgement, never the truth dict (beliefs,
         # scheduler fields stay hidden)
-        return {"assigned": task_id, "to": npc_id, "title": task["title"]}
+        return {"assigned": task_id, "to": npc_id, "title": task["title"],
+                "handoff_minutes": handoff if old_owners != [npc_id] else 0}
 
     def _restamp_owners(self, task_id, new_assignees, verb):
         """Change a task's assignee SET, banking progress-so-far and stamping the
@@ -310,7 +381,7 @@ class Engine:
         (coordination overhead) and it costs the helper their own work. Worth it
         for a bottleneck / an idle teammate, not as a default."""
         task = self.world.find_task(task_id)
-        if task is None or task.get("filed") is False:
+        if not self.world.task_visible(task) or task.get("filed") is False:
             return {"error": "no task %r on the tracker" % task_id}
         if npc_id not in self.world.npcs:
             return {"error": "unknown person %r" % npc_id}
@@ -323,17 +394,28 @@ class Engine:
             return {"error": "%s is already on %r" % (npc_id, task_id)}
         self._advance_action_clock()
         self._restamp_owners(task_id, owners + [npc_id], "add")
+        onboarding = int((self.world.scenario.get("costs") or {})
+                         .get("helper_onboarding_minutes", 0))
+        if onboarding:
+            self.world.record("capacity_cost", person=npc_id,
+                              task_id=task_id, minutes=onboarding,
+                              reason="helper_onboarding")
+            self.world.npcs[npc_id].notify(
+                self.world.clock,
+                "onboarding on '%s' will cost about %d minutes"
+                % (task["title"], onboarding))
         self.world.npcs[npc_id].notify(self.world.clock,
                                        "you're now helping on: '%s'" % task["title"])
         self._say("[%s] you added %s to help on %s"
                   % (self.world.now(), self.world.npcs[npc_id].name, task_id))
-        return {"task_id": task_id, "assignees": owners + [npc_id]}
+        return {"task_id": task_id, "assignees": owners + [npc_id],
+                "onboarding_minutes": onboarding}
 
     def agent_drop_helper(self, task_id, npc_id):
         """Take a helper back OFF a task (return them to their own work). Can't
         drop the last/only owner — reassign that instead."""
         task = self.world.find_task(task_id)
-        if task is None or task.get("filed") is False:
+        if not self.world.task_visible(task) or task.get("filed") is False:
             return {"error": "no task %r on the tracker" % task_id}
         owners = task.get("assignees") or []
         if npc_id not in owners:
@@ -353,7 +435,7 @@ class Engine:
         authored `priority` keeps its rubric weight, so the PM can decide
         what gets worked first but can never relabel a task to mint value."""
         task = self.world.find_task(task_id)
-        if task is None or task.get("filed") is False:
+        if not self.world.task_visible(task) or task.get("filed") is False:
             return {"error": "no task %r on the tracker" % task_id}
         if priority is not None and priority not in ("P0", "P1", "P2", "P3"):
             return {"error": "priority must be P0..P3, got %r" % priority}
@@ -381,10 +463,58 @@ class Engine:
                   % (self.world.now(), task_id, changes))
         return {"task_id": task_id, **changes}
 
+    def agent_answer_question(self, task_id, question_id, choice, rationale,
+                              via):
+        """Deliver one explicit decision on an open blocking question."""
+        task = self.world.find_task(task_id)
+        if not self.world.task_visible(task) or task.get("filed") is False:
+            return {"error": "no task %r on the tracker" % task_id}
+        question = next((q for q in task.get("questions") or []
+                         if q.get("gates") and q.get("id") == question_id), None)
+        if question is None:
+            return {"error": "no open blocking question %r on %r"
+                    % (question_id, task_id)}
+        if self.world.clock < question["at"]:
+            return {"error": "question %r has not opened yet" % question_id}
+        if question_id in self.world.question_answers().get(task_id, {}):
+            return {"error": "question %r is already answered" % question_id}
+        if "options" in question and choice not in question["options"]:
+            return {"error": "choice must be one of %s" % question["options"]}
+        if via not in ("chat", "email"):
+            return {"error": "via must be chat or email"}
+        if not choice.strip() or not rationale.strip():
+            return {"error": "choice and rationale must be non-empty"}
+        owner = (task.get("assignees") or [None])[0]
+        if owner not in self.world.npcs:
+            return {"error": "question owner is not a current worker"}
+
+        effect = deepcopy((question.get("choice_effects") or {}).get(choice, {}))
+        text = ("Decision for '%s' / %s: %s. Rationale: %s"
+                % (task["title"], question_id, choice, rationale))
+        if via == "chat":
+            sent = self.agent_chat([owner], text)
+            delivered_at = self.world.clock
+        else:
+            sent = self.agent_email([owner], "Decision: " + task["title"], text)
+            answer_batch = self.world.scenario.get("answer_batch_minutes", 120)
+            delivered_at = ((self.world.clock // answer_batch + 1)
+                            * answer_batch)
+        if "error" in sent:
+            return sent
+        self.world.record("question_answered", task_id=task_id,
+                          question_id=question_id, choice=choice,
+                          rationale=rationale, via=via, owner=owner,
+                          delivered_at=delivered_at, effect=effect)
+        out = {"task_id": task_id, "question_id": question_id,
+               "choice": choice, "via": via, "delivered_at": delivered_at}
+        if effect.get("summary"):
+            out["effect_summary"] = effect["summary"]
+        return out
+
     def agent_update_note(self, task_id, note):
         """Correct the tracker's reported status (record vs truth hygiene)."""
         task = self.world.find_task(task_id)
-        if task is None or task.get("filed") is False:
+        if not self.world.task_visible(task) or task.get("filed") is False:
             return {"error": "no task %r on the tracker" % task_id}
         self._advance_action_clock()
         self.world.update_task(task_id, {"reported": note}, "agent")
@@ -407,7 +537,7 @@ class Engine:
                     % (duration, self.bounds["max_meeting_minutes"])}
         if task is not None:
             t = self.world.find_task(task)
-            if t is None or t.get("filed") is False:
+            if not self.world.task_visible(t) or t.get("filed") is False:
                 return {"error": "no task %r on the tracker to align" % task}
         self._advance_action_clock()
         # strictly future: a due-now meeting_start may never sit undispatched
@@ -633,16 +763,18 @@ class Engine:
         for _ in range(max_events):
             nxt = self.queue.peek()
             if nxt is None or nxt.time > horizon:
+                self.advance_until(horizon)
                 return None
+            before = len(self.world.log)
             self.step()
-            log = self.world.log
             # a chat arriving or an email batch landing both count as "the
             # next message for you" — everything reaches the PM as an event
-            if log and ((log[-1]["kind"] == "message"
-                         and log[-1]["recipient"] == "agent"
-                         and log[-1].get("via", "chat") == "chat")
-                        or log[-1]["kind"] == "email_delivered"):
-                msg = log[-1]
+            msg = next((e for e in self.world.log[before:]
+                        if (e["kind"] == "message" and e["recipient"] == "agent"
+                            and e.get("via", "chat") == "chat")
+                        or (e["kind"] == "email_delivered"
+                            and e.get("recipient", "agent") == "agent")), None)
+            if msg is not None:
                 # CAUSALITY: drain co-temporal events before returning control
                 self._drain_due()
                 return msg
@@ -672,6 +804,7 @@ class Engine:
             # (completions) are delivered but never break sleep.
             if interruptible and any(
                     "chat_from" in i or "email_from" in i or "in_meeting" in i
+                    or "work_revealed" in i
                     for i in self._push_items(self.world.log[self._push_cursor:])):
                 # CAUSALITY: being woken must not leave co-temporal events
                 # undispatched — everything due at this instant happens
@@ -727,6 +860,11 @@ class Engine:
                     self._schedule_email_delivery(msg)
                 self._say("[%s] %s (%s): %s" % (self.world.now(), npc.name, via, text))
             return
+
+        if event.kind == "work_reveal_check":
+            self._reveal_checks.discard(
+                (event.payload["task"], event.time))
+            return  # step() runs the deterministic completion/reveal fold
 
         if event.kind == "org_pickup":
             arr = self.world.scenario["task_arrivals"][event.payload["arrival"]]
@@ -832,6 +970,8 @@ class Engine:
                              "you've just realized about '%s': %s"
                              % (t["title"], b.get("note", "")))
                 if b.get("proactive_ping"):
+                    self.world.record("belief_revealed", task_id=t["id"],
+                                      holder=holder, idx=event.payload["idx"])
                     text = self._llm(lambda: npc_h.ping(
                         self.client, self.world,
                         "You just discovered: %s. You've decided to tell Alex "
@@ -860,6 +1000,16 @@ class Engine:
                     "You're blocked on '%s' and need Alex's answer to continue. "
                     "Raise it now, in your own way: %s"
                     % (t["title"], q.get("ping", "you need a decision from the PM"))))
+                effects = q.get("choice_effects") or {}
+                choices = [
+                    "%s%s" % (choice,
+                              " (%s)" % effects[choice].get("summary", "")
+                              if choice in effects else "")
+                    for choice in (q.get("options") or [])
+                ]
+                text = ("%s\n(blocking question: task=%s, question_id=%s, "
+                        "options=%s)" % (
+                            text, t["id"], q["id"], ", ".join(choices)))
                 self.world.send_message(npc_h.id, "agent", text)
                 self._say("[%s] %s: %s" % (self.world.now(), npc_h.name, text))
             return

@@ -134,6 +134,7 @@
   "rubric": "rubrics/demo.json",
   "herrings": [],
   "band": {
+    "scored_with": "2458a86e1d93",
     "no_pm_baseline": {
       "combined": 27.018,
       "completion": 30.0,
